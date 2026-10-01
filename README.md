@@ -2,6 +2,14 @@
 
 **Maharashtra Public Works Department (Electrical Wing) · PWD Electrical Engineers**
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Mukesh931/smart-mb)
+
+**Live demo:** <https://smart-mb.onrender.com> — sign in as `admin@pwd.maharashtra.gov.in` / `Admin@123`
+or `je.nashik@pwd.maharashtra.gov.in` / `Engineer@123`. *(Free Render instance: it sleeps after 15 idle
+minutes and cold-starts in ~1 minute; see the free-tier note in [`docs/DEPLOY.md`](docs/DEPLOY.md) before
+using it for real data — the free plan has no persistent disk, so the SQLite file resets on
+spin-down/redeploy.)*
+
 A mobile-first platform where the **Master Electrical CSR (Schedule of Rates)** lives once, in a
 database controlled by the Super Admin, and every project **references** it. Site engineers upload a
 Technical Sanction estimate, the platform maps it against the master, builds a measurement checklist,
@@ -313,7 +321,26 @@ curl -s https://<your-service>.onrender.com/api/health
 
 ---
 
-## 9 · Notes & honest limitations
+## 9 · Hosting it yourself
+
+| | Free instance | Starter + 1 GB disk ($7/mo) |
+|---|---|---|
+| Cost | $0 | ~$7/month |
+| Sleeps after 15 idle min | yes (≈1 min cold start) | no |
+| SQLite DB, uploads, site photos | **lost on spin-down/redeploy** | persisted on the disk at `/var/data` |
+| Suitable for | demos, evaluation | real field measurement work |
+
+Deploy the durable variant (needs payment details on the Render account):
+
+```bash
+export GITHUB_TOKEN=... RENDER_API_KEY=...
+python3 -m tools.deploy_all render --plan starter --disk   # adds a 1 GB disk at /var/data
+python3 -m tools.deploy_all status                          # plan, disk, deploys, live health
+```
+
+For heavier use, point `app/db.py` at Render Postgres instead of SQLite (the schema maps 1:1).
+
+## 10 · Notes & honest limitations
 
 * The bundled CSR is a **demo subset** (163 items, representative rates) modelled on the published
   chapter/section/item-code structure of the Maharashtra PWD Electrical Schedule of Rates — replace it

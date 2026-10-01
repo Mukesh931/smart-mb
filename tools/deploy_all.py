@@ -194,6 +194,7 @@ def deploy_render(args, repo_url: str = "") -> dict:
         if svc.get("name") == args.service_name and svc.get("type") == "web_service":
             existing = svc
             break
+    deploy_id = ""
 
     if existing:
         svc_id = existing["id"]
@@ -204,17 +205,19 @@ def deploy_render(args, repo_url: str = "") -> dict:
         })
         _, deploy = request(f"{RENDER_API}/services/{svc_id}/deploys", method="POST", token=token,
                             body={"clearCache": "do_not_clear"})
+        dep = (deploy or {}).get("deploy", deploy) or {}
+        deploy_id = dep.get("id")
     else:
         print("[render] creating web service")
         status, created = request(f"{RENDER_API}/services", method="POST", token=token, body=payload)
         svc_id = created["service"]["id"]
-        deploy = created.get("deploy") or {}
+        deploy_id = created.get("deployId")            # create-service returns {service, deployId}
         print(f"[render] created {svc_id} — dashboard: {created['service'].get('dashboardUrl', '')}")
-        if not deploy:
+        if not deploy_id:
             _, deploy = request(f"{RENDER_API}/services/{svc_id}/deploys", method="POST", token=token,
-                               body={"clearCache": "do_not_clear"})
-
-    deploy_id = (deploy or {}).get("id")
+                                body={"clearCache": "do_not_clear"})
+            dep = (deploy or {}).get("deploy", deploy) or {}
+            deploy_id = dep.get("id")
     print(f"[render] deploy {deploy_id} started — waiting for it to go live")
     url = ""
     deadline = time.time() + args.wait
@@ -251,8 +254,12 @@ def smoke(url: str) -> bool:
             print(f"[verify] OK — {body}")
             with urllib.request.urlopen(url.rstrip("/") + "/", timeout=45) as res:
                 html = res.read().decode(errors="replace")
+            ok = res.status == 200 and "Smart-MB" in html and "app.js" in html
             print(f"[verify] SPA served: {res.status} · {len(html) // 1024} KiB · "
-                  f"login screen present: {'Smart-MB Platform' in html}")
+                  f"app shell intact: {ok}")
+            for asset in ("/style.css", "/app.js"):
+                with urllib.request.urlopen(url.rstrip("/") + asset, timeout=45) as a:
+                    print(f"[verify] {asset} -> {a.status} ({len(a.read()) // 1024} KiB)")
             return True
         except Exception as exc:                                    # noqa: BLE001
             print(f"         attempt {attempt + 1}/12: {exc}")
@@ -260,10 +267,46 @@ def smoke(url: str) -> bool:
     return False
 
 
+# ------------------------------------------------------------------- status
+def status(args) -> dict:
+    token = os.environ.get("RENDER_API_KEY", "").strip()
+    if not token:
+        sys.exit("RENDER_API_KEY is not set.")
+    _, listing = request(f"{RENDER_API}/services?name={args.service_name}&limit=5", token=token)
+    svc = None
+    for item in listing or []:
+        cand = item.get("service", item)
+        if cand.get("name") == args.service_name:
+            svc = cand
+            break
+    if not svc:
+        sys.exit(f"No Render service named '{args.service_name}' in this workspace.")
+    _, full = request(f"{RENDER_API}/services/{svc['id']}", token=token)
+    full = full.get("service", full)
+    details = full.get("serviceDetails") or {}
+    url = details.get("url", "")
+    _, deploys = request(f"{RENDER_API}/services/{svc['id']}/deploys?limit=3", token=token)
+    print(f"service : {full['name']} ({full['id']})")
+    print(f"url     : {url}")
+    print(f"plan    : {details.get('plan')} · region {details.get('region')} · "
+          f"autoDeploy {full.get('autoDeployTrigger') or full.get('autoDeploy')}")
+    print(f"disk    : {details.get('disk') or 'none — the SQLite database resets on every spin-down/redeploy'}")
+    for item in deploys or []:
+        dep = item.get("deploy", item)
+        print(f"deploy  : {dep.get('id')} {dep.get('status'):<12} {(dep.get('commit') or {}).get('message', '')[:60]}")
+    if url:
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/api/health", timeout=60) as res:
+                print(f"health  : {json.loads(res.read())}")
+        except Exception as exc:                                     # noqa: BLE001
+            print(f"health  : unreachable ({exc}) — free instances sleep after 15 min idle and cold-start in ~1 min")
+    return {"service_id": svc["id"], "url": url}
+
+
 # --------------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser(description="Deploy Smart-MB to GitHub and Render")
-    ap.add_argument("target", choices=["github", "render", "all"])
+    ap.add_argument("target", choices=["github", "render", "all", "status"])
     ap.add_argument("--repo-name", default="smart-mb")
     ap.add_argument("--gh-owner", default="", help="GitHub owner (used to build the Render repo URL)")
     ap.add_argument("--repo-url", default="", help="explicit repo URL for Render")
@@ -281,6 +324,9 @@ def main() -> None:
     args = ap.parse_args()
 
     result: dict = {}
+    if args.target == "status":
+        print(json.dumps(status(args), indent=2))
+        return
     if args.target in ("github", "all"):
         result["github"] = deploy_github(args)
         if not args.gh_owner:
