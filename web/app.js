@@ -1,0 +1,1536 @@
+/* ============================================================================
+   Smart-MB | Maharashtra PWD Electrical
+   Centralized CSR Database & Site Verification System - front-end
+   Single-file vanilla SPA: hash router, live API, offline demo fallback.
+   ========================================================================== */
+'use strict';
+
+const API_BASE = '';
+const S = {
+  token: localStorage.getItem('smartmb_token') || '',
+  user: JSON.parse(localStorage.getItem('smartmb_user') || 'null'),
+  route: { name: 'dashboard', params: {} },
+  demo: false,
+  csr: { fy: '', region: '', q: '', category: '', chapter: '', page: 0, limit: 40 },
+  proj: { id: null, tab: 'overview', room: null, data: null },
+  importPreview: null,
+  adminTab: 'master',
+};
+
+/* ------------------------------------------------------------------ utils */
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function inr(n, dp = 2) {
+  if (n == null || n === '' || isNaN(n)) return '—';
+  const neg = n < 0; n = Math.abs(Number(n));
+  const fixed = dp ? n.toFixed(dp) : String(Math.round(n));
+  let [w, f] = fixed.split('.');
+  if (w.length > 3) {
+    const t = w.slice(-3); let h = w.slice(0, -3); const parts = [];
+    while (h.length > 2) { parts.unshift(h.slice(-2)); h = h.slice(0, -2); }
+    if (h) parts.unshift(h);
+    w = parts.join(',') + ',' + t;
+  }
+  return (neg ? '-' : '') + w + (f ? '.' + f : '');
+}
+const n2 = (v, dp = 2) => (v == null || isNaN(v)) ? '—' : Number(v).toFixed(dp).replace(/\.?0+$/, (m) => m.includes('.') ? '' : m) || '0';
+function smartNum(v) {
+  if (v == null || isNaN(v)) return '—';
+  const n = Number(v);
+  return Number.isInteger(n) ? String(n) : n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+const dt = (s) => { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? s : d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }); };
+const dtt = (s) => { if (!s) return '—'; const d = new Date(s); return isNaN(d) ? s : d.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); };
+const today = () => new Date().toISOString().slice(0, 10);
+const debounce = (fn, ms = 320) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+
+const ICON = {
+  dash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M3 13h8V3H3v10Zm10 8h8V11h-8v10ZM3 21h8v-5H3v5Zm10-13h8V3h-8v5Z"/></svg>',
+  book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 4h11a3 3 0 0 1 3 3v13H7a3 3 0 0 1-3-3V4Zm14 3h2v13a3 3 0 0 0-3-3h-8"/><path d="M8 8h6M8 12h6"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 3l8 3v6c0 5-3.4 8.3-8 9-4.6-.7-8-4-8-9V6l8-3Z"/><path d="M9 12l2 2 4-4"/></svg>',
+  ruler: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="m3 17 4-4 3 3 3-3 3 3 5-5M4 20h16"/></svg>',
+  doc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"><path d="M12 5v14M5 12h14"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.4-3.4"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.2"/></svg>',
+  up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 17V5m0 0L7 10m5-5 5 5M5 19h14"/></svg>',
+  down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 5v12m0 0 5-5m-5 5-5-5M5 19h14"/></svg>',
+  out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M10 5H6v14h4M14 8l4 4-4 4M18 12H10"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 4l9 16H3L12 4Z"/><path d="M12 10v4m0 3h.01"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m5 13 4 4L19 7"/></svg>',
+  sparkle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z"/><path d="M18 16l.9 2.1L21 19l-2.1.9L18 22l-.9-2.1L15 19l2.1-.9L18 16Z"/></svg>',
+  chart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 20V4m0 16h16M8 16V9m4 7V6m4 10v-5"/></svg>',
+};
+
+/* ------------------------------------------------------------ api / demo */
+const DEMO = (() => { try { return JSON.parse(document.getElementById('demo-snapshot').textContent); } catch (e) { return null; } })();
+
+function demoLookup(path, method) {
+  if (!DEMO || method !== 'GET') return null;
+  const p = path.split('?')[0].replace(/^\/api/, '');
+  const map = [
+    [/^\/dashboard$/, () => DEMO.dashboard],
+    [/^\/csr\/versions$/, () => ({ versions: DEMO.versions })],
+    [/^\/csr\/facets$/, () => DEMO.facets],
+    [/^\/csr\/items$/, () => DEMO.csr_items],
+    [/^\/csr\/suggest$/, () => ({ results: DEMO.suggest })],
+    [/^\/projects$/, () => ({ projects: DEMO.projects })],
+    [/^\/projects\/(\d+)$/, (m) => (Number(m[1]) === DEMO.project.project.id ? DEMO.project : null)],
+    [/^\/projects\/(\d+)\/items$/, () => ({ items: DEMO.items })],
+    [/^\/projects\/(\d+)\/checklist$/, () => DEMO.checklist],
+    [/^\/projects\/(\d+)\/deviations$/, () => DEMO.deviations],
+    [/^\/projects\/(\d+)\/measurements$/, () => ({ measurements: DEMO.measurements, count: DEMO.measurements.length, total_amount: 0 })],
+    [/^\/admin\/overview$/, () => DEMO.admin],
+    [/^\/admin\/parse-jobs$/, () => ({ jobs: [] })],
+    [/^\/auth\/me$/, () => ({ user: DEMO.user })],
+  ];
+  for (const [re, fn] of map) { const m = p.match(re); if (m) { const r = fn(m); if (r) return r; } }
+  return null;
+}
+
+async function api(path, { method = 'GET', body, form, raw } = {}) {
+  const url = API_BASE + path;
+  const opt = { method, headers: {} };
+  if (S.token) opt.headers['Authorization'] = 'Bearer ' + S.token;
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  if (form) opt.body = form;
+  try {
+    const res = await fetch(url, opt);
+    if (raw) return res;
+    const text = await res.text();
+    let data; try { data = text ? JSON.parse(text) : {}; } catch (e) { data = { detail: text }; }
+    if (!res.ok) throw Object.assign(new Error(data.detail || ('HTTP ' + res.status)), { status: res.status, data });
+    return data;
+  } catch (err) {
+    if (err.status) throw err;
+    const dm = demoLookup(path, method);
+    if (dm && S.demo) return dm;
+    if (DEMO && method === 'GET' && !S.demo) {
+      const dm2 = demoLookup(path, method);
+      if (dm2) return dm2;
+    }
+    throw Object.assign(new Error('Network unavailable. Start the server to use live data.'), { offline: true });
+  }
+}
+
+function enterDemo() {
+  S.demo = true; S.token = ''; S.user = DEMO.user;
+  const p = DEMO.project.project;
+  S.proj.id = p.id;
+  S.csr.fy = DEMO.versions[0].fy; S.csr.region = DEMO.versions[0].region;
+  toast('Offline demo mode — read-only sample data. Start the server for the full app.', 'warn', 6000);
+  location.hash = '#/dashboard';
+}
+
+async function download(path, filename) {
+  try {
+    const res = await fetch(API_BASE + path, { headers: S.token ? { Authorization: 'Bearer ' + S.token } : {} });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { msg = (await res.json()).detail || msg; } catch (e) { }
+      if (res.status === 401) msg = 'Session expired — sign in again to download reports.';
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
+    toast('Download started: ' + filename, 'ok');
+  } catch (e) { toast('Download failed — ' + e.message, 'bad'); }
+}
+
+/* ------------------------------------------------------------ ui helpers */
+function toast(msg, kind = '', ms = 3600) {
+  const wrap = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.innerHTML = `${kind === 'bad' ? ICON.warn : kind === 'ok' ? ICON.check : kind === 'warn' ? ICON.warn : ICON.ruler}<div>${esc(msg)}</div>`;
+  wrap.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 320); }, ms);
+}
+function closeSheet() { const s = document.querySelector('.sheet-bg'); if (s) s.remove(); }
+function sheet({ title, body, footer, wide = false, onOpen }) {
+  closeSheet();
+  const el = document.createElement('div');
+  el.className = 'sheet-bg';
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" ${wide ? 'style="max-width:920px"' : ''}>
+    <div class="grabber mob-only"></div>
+    <div class="hd"><h3>${esc(title)}</h3><button class="btn sm" data-act="close-sheet">${ICON.x}</button></div>
+    <div class="bd">${body}</div>
+    ${footer ? `<div class="ft">${footer}</div>` : ''}</div>`;
+  document.body.appendChild(el);
+  el.addEventListener('click', (e) => {
+    if (e.target === el || e.target.closest('[data-act="close-sheet"]')) closeSheet();
+  });
+  if (onOpen) onOpen(el);
+  return el;
+}
+const loading = (label = 'Loading…') => `<div class="stack"><div class="card"><div class="bd"><div class="row"><div class="spin" style="border-color:#0b5c8a;border-top-color:transparent"></div><span class="muted">${esc(label)}</span></div></div></div>
+  <div class="card"><div class="bd stack"><div class="skeleton" style="width:70%"></div><div class="skeleton" style="width:88%"></div><div class="skeleton" style="width:54%"></div></div></div></div>`;
+
+function badgeFor(status) {
+  const m = {
+    matched: ['ok', 'Matched to CSR'], excess: ['bad', 'Excess'], saving: ['ok', 'Saving'],
+    pending: ['warn', 'Not measured'], unknown_item: ['ns', 'Unknown / Non-schedule'],
+    critical: ['bad', 'Critical deviation'], review: ['warn', 'Review ±10%'], info: ['info', 'Minor deviation'],
+    ok: ['ok', 'OK'], active: ['ok', 'Active'], completed: ['info', 'Completed'],
+  };
+  const [k, label] = m[status] || ['', status];
+  return `<span class="badge ${k}">${esc(label)}</span>`;
+}
+
+/* ------------------------------------------------------------------ router */
+function parseHash() {
+  const h = (location.hash || '#/dashboard').replace(/^#\/?/, '');
+  const seg = h.split('/').filter(Boolean);
+  if (!seg.length) return { name: 'dashboard', params: {} };
+  if (seg[0] === 'project' && seg[1]) return { name: 'project', params: { id: Number(seg[1]) } };
+  if (seg[0] === 'csr') return { name: 'csr', params: { q: seg[1] ? decodeURIComponent(seg[1]) : '' } };
+  return { name: seg[0], params: {} };
+}
+
+async function render() {
+  if (!S.token && !S.demo) { renderLogin(); return; }
+  S.route = parseHash();
+  const app = document.getElementById('app');
+  app.innerHTML = shell();
+  const view = document.getElementById('view');
+  view.innerHTML = loading();
+  try {
+    if (S.route.name === 'dashboard') await viewDashboard(view);
+    else if (S.route.name === 'csr') await viewCSR(view);
+    else if (S.route.name === 'projects') await viewProjects(view);
+    else if (S.route.name === 'project') await viewProject(view, S.route.params.id);
+    else if (S.route.name === 'admin') await viewAdmin(view);
+    else view.innerHTML = `<div class="empty">Unknown screen</div>`;
+  } catch (err) {
+    if (err.status === 401) { S.token = ''; S.user = null; localStorage.removeItem('smartmb_token'); renderLogin(); return; }
+    view.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>Could not load this screen.</b><br>${esc(err.message)}</div></div>`;
+  }
+  markNav();
+}
+
+function shell() {
+  const u = S.user || { name: 'Guest', role: 'engineer' };
+  const isAdmin = u.role === 'admin';
+  const navItems = [
+    ['#/dashboard', 'dash', 'Dashboard'],
+    ['#/csr', 'book', 'Master CSR'],
+    ['#/projects', 'folder', 'Projects'],
+    ['#/project/' + (S.proj.id || 1), 'ruler', 'Measurement'],
+    ...(isAdmin ? [['#/admin', 'shield', 'Admin Control']] : []),
+  ];
+  return `
+  <div class="app">
+    <aside class="side">
+      <div class="brand">
+        <div class="mark">SM</div>
+        <div><b>Smart-MB</b><span>PWD Electrical · Maharashtra</span></div>
+      </div>
+      <nav class="nav">
+        <div class="sechead">Workspace</div>
+        ${navItems.slice(0, 3).map(([h, i, l]) => `<a href="${h}" data-nav="${h}">${ICON[i]}${l}</a>`).join('')}
+        <div class="sechead">Site verification</div>
+        ${navItems.slice(3).map(([h, i, l]) => `<a href="${h}" data-nav="${h}">${ICON[i]}${l}</a>`).join('')}
+      </nav>
+      <div class="who">
+        <b>${esc(u.name)}</b><span>${esc(u.designation || u.role)}</span><br>
+        <span>${esc(u.division || '')}</span>
+        <div class="row" style="margin-top:8px">
+          <button class="btn sm" data-act="logout" style="background:transparent;color:#cbd8e6;border-color:rgba(255,255,255,.2)">Sign out</button>
+          ${S.demo ? '<span class="badge warn tiny">DEMO</span>' : ''}
+        </div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div style="flex:1;min-width:0"><h1 id="ptitle">Smart-MB<small id="psub">Centralized CSR Database & Site Verification System</small></h1></div>
+        <span class="badge brand desk-only">CSR ${esc(S.csr.fy || '2024-25')} · ${esc(S.csr.region || (u.region || 'Pune'))}</span>
+        <button class="btn sm" data-act="help">?</button>
+      </header>
+      <div class="wrap with-bottom" id="view"></div>
+      <nav class="bottomnav">
+        ${[['#/dashboard', 'dash', 'Home'], ['#/csr', 'book', 'CSR'], ['#/projects', 'folder', 'Projects'],
+      ['#/project/' + (S.proj.id || 1), 'ruler', 'Measure'], ...(isAdmin ? [['#/admin', 'shield', 'Admin']] : [])]
+      .map(([h, i, l]) => `<a href="${h}" data-nav="${h}">${ICON[i]}<span>${l}</span></a>`).join('')}
+      </nav>
+    </main>
+  </div>`;
+}
+function markNav() {
+  document.querySelectorAll('[data-nav]').forEach((a) => {
+    const h = a.getAttribute('data-nav'); const cur = '#/' + S.route.name;
+    a.classList.toggle('on', h === cur || (S.route.name === 'project' && h.startsWith('#/project')));
+  });
+}
+function setTitle(t, s) { const a = document.getElementById('ptitle'); if (a) a.innerHTML = `${esc(t)}<small>${esc(s || '')}</small>`; }
+function logout() {
+  S.token = ''; S.user = null; S.demo = false;
+  localStorage.removeItem('smartmb_token'); localStorage.removeItem('smartmb_user');
+  location.hash = ''; renderLogin();
+}
+
+/* ------------------------------------------------------------------- login */
+function renderLogin() {
+  document.getElementById('app').innerHTML = `
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="top">
+        <div class="mark">SM</div>
+        <h2>Smart-MB Platform</h2>
+        <p>Centralized CSR Database &amp; Site Verification System<br>Public Works Department (Electrical Wing) · Government of Maharashtra</p>
+      </div>
+      <div class="bd stack">
+        <div id="login-err"></div>
+        <div><label class="f">Official email</label><input class="i" id="l-email" type="email" placeholder="je.nashik@pwd.maharashtra.gov.in" autocomplete="username"></div>
+        <div><label class="f">Password</label><input class="i" id="l-pass" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <button class="btn pri block" data-act="login" id="l-btn">Sign in</button>
+        <div class="hr"></div>
+        <div class="muted small"><b>Demo accounts</b> (click to fill)</div>
+        <div class="demo-creds">
+          <button class="btn sm" data-act="fill" data-email="admin@pwd.maharashtra.gov.in" data-pass="Admin@123">
+            <span class="badge brand">Super Admin</span> admin@pwd.maharashtra.gov.in</button>
+          <button class="btn sm" data-act="fill" data-email="je.nashik@pwd.maharashtra.gov.in" data-pass="Engineer@123">
+            <span class="badge ok">Site Engineer</span> je.nashik@pwd.maharashtra.gov.in</button>
+        </div>
+        ${DEMO ? `<button class="btn block" data-act="demo" style="margin-top:4px">${ICON.sparkle} Explore offline demo (sample data)</button>` : ''}
+        <div class="hint">Live data is served by the Smart-MB API. The offline demo renders a bundled snapshot and is read-only.</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* --------------------------------------------------------------- dashboard */
+async function viewDashboard(view) {
+  setTitle('Dashboard', 'Role-aware overview of works, measurements and CSR usage');
+  const [d, csrV] = await Promise.all([api('/api/dashboard'), api('/api/csr/versions').catch(() => ({ versions: [] }))]);
+  if (!S.csr.fy && csrV.versions.length) {
+    S.csr.fy = csrV.versions[0].fy; S.csr.region = csrV.versions[0].region;
+  }
+  const t = d.totals;
+  const cat = d.by_category || [];
+  const maxAmt = Math.max(1, ...cat.map((c) => c.amount));
+  view.innerHTML = `
+    <div class="grid g4" style="margin-bottom:14px">
+      <div class="card kpi"><div class="lbl">Active projects</div><div class="val">${t.projects}</div>
+        <div class="foot">${(d.projects || []).filter(p => p.status === 'active').length} in progress</div></div>
+      <div class="card kpi"><div class="lbl">Measurement entries</div><div class="val">${t.measurements}</div>
+        <div class="foot">jointly recorded at site</div></div>
+      <div class="card kpi"><div class="lbl">Measured value</div><div class="val sm">₹ ${inr(t.measured_value)}</div>
+        <div class="foot">valued at Master CSR rates</div></div>
+      <div class="card kpi"><div class="lbl">Master CSR items</div><div class="val sm">${csrV.versions.filter(v => v.fy === S.csr.fy).map(v => v.item_count).reduce((a, b) => a + b, 0) || '—'}</div>
+        <div class="foot">CSR ${esc(S.csr.fy)} · ${csrV.versions.length} FY × region versions</div></div>
+    </div>
+
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="hd"><h3>Works in hand</h3><div style="flex:1"></div>
+          <a class="btn sm" href="#/projects">${ICON.folder} All projects</a></div>
+        <div class="bd stack">
+          ${(d.projects || []).length ? d.projects.map((p) => `
+            <div class="item-card" style="cursor:pointer" data-act="open-project" data-id="${p.id}">
+              <div class="row between"><div class="pill-code">${esc(p.project_code)}</div>${badgeFor(p.status)}</div>
+              <div style="font-weight:650">${esc(p.name)}</div>
+              <div class="small muted">${esc(p.division || '')} · TS ${esc(p.ts_no || '—')} · MB ${esc(p.mb_no || '—')}</div>
+              <div class="progress"><i style="width:${Math.min(100, p.progress_pct || 0)}%"></i></div>
+              <div class="row between small">
+                <span class="muted">${p.items} items · est. ₹ ${inr(p.tendered_amount)}</span>
+                <span><b>${p.progress_pct}%</b> measured (₹ ${inr(p.measured_amount)})</span></div>
+            </div>`).join('') : `<div class="empty">${ICON.folder}<div>No projects yet. Create one from the Projects screen.</div></div>`}
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <div class="hd"><h3>Value distribution by work head</h3></div>
+          <div class="bd stack">
+            ${cat.length ? cat.slice(0, 7).map((c) => `
+              <div class="bar-row">
+                <span class="nowrap" title="${esc(c.category)}">${esc((c.category || 'Other').slice(0, 20))}</span>
+                <span class="track"><i style="width:${Math.max(3, (c.amount / maxAmt) * 100)}%"></i></span>
+                <span class="right mono small">₹ ${inr(c.amount, 0)}</span>
+              </div>`).join('') : '<div class="muted small">No measured value yet.</div>'}
+          </div>
+        </div>
+        <div class="card">
+          <div class="hd"><h3>Latest joint measurements</h3></div>
+          <div class="bd tight scrollx">
+            <table class="tbl"><thead><tr><th>Item</th><th>Location</th><th>Item description</th><th class="num">Qty</th><th class="num">Amount</th><th></th></tr></thead>
+            <tbody>${(d.recent_measurements || []).map((m) => `
+              <tr><td><span class="pill-code">${esc(m.item_code)}</span></td>
+                <td class="small">${esc(m.room_name || '—')}</td>
+                <td class="small">${esc((m.description || '').slice(0, 74))}…</td>
+                <td class="num">${smartNum(m.measured_qty)} ${esc(m.unit)}</td>
+                <td class="num">₹ ${inr((m.measured_qty || 0) * (m.rate || 0), 0)}</td>
+                <td><a class="btn sm" href="#/project/${m.project_id}">Open</a></td></tr>`).join('')
+      || '<tr><td colspan="6" class="empty">No measurements recorded yet.</td></tr>'}</tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* --------------------------------------------------------------- master CSR */
+async function viewCSR(view) {
+  setTitle('Master CSR Database', 'Admin-controlled Schedule of Rates — every project maps against this source of truth');
+  const isAdmin = S.user.role === 'admin';
+  const versions = (await api('/api/csr/versions')).versions;
+  if (!S.csr.fy && versions.length) { S.csr.fy = versions[0].fy; S.csr.region = versions[0].region; }
+  const fys = [...new Set(versions.map((v) => v.fy))];
+  const regions = versions.filter((v) => v.fy === S.csr.fy).map((v) => v.region);
+  if (!regions.includes(S.csr.region)) S.csr.region = regions[0];
+  const qp = new URLSearchParams({ fy: S.csr.fy, region: S.csr.region, limit: S.csr.limit, offset: S.csr.page * S.csr.limit });
+  if (S.csr.q) qp.set('q', S.csr.q);
+  if (S.csr.category) qp.set('category', S.csr.category);
+  if (S.csr.chapter) qp.set('chapter', S.csr.chapter);
+  const [list, facets] = await Promise.all([
+    api('/api/csr/items?' + qp.toString()), api(`/api/csr/facets?fy=${S.csr.fy}&region=${S.csr.region}`)]);
+
+  view.innerHTML = `
+    ${isAdmin ? `<div class="card" style="margin-bottom:14px">
+      <div class="hd">${ICON.up}<h3>Master CSR control</h3><div style="flex:1"></div>
+        <span class="badge brand">Super Admin</span></div>
+      <div class="bd">
+        <div class="notice info" style="margin-bottom:12px">${ICON.shield}<div>The Master Database is the permanent, pre-loaded Schedule of Rates. Projects only <b>reference</b> it: descriptions, units and rates are always pulled from here, so a blurry estimate PDF can never corrupt a legal description or a rate.</div></div>
+        <div class="grid g4">
+          <div><label class="f">Financial year</label><select class="i" id="imp-fy">${fys.map((f) => `<option>${esc(f)}</option>`).join('')}</select></div>
+          <div><label class="f">Region</label><select class="i" id="imp-region">${regions.map((r) => `<option>${esc(r)}</option>`).join('')}</select></div>
+          <div><label class="f">Import mode</label><select class="i" id="imp-mode"><option value="merge">Merge / update existing codes</option><option value="replace">Replace entire version</option></select></div>
+          <div><label class="f">CSR file (.xlsx / .csv)</label><input class="i" type="file" id="imp-file" accept=".xlsx,.xlsm,.csv"></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn" data-act="csr-preview">${ICON.sparkle} Preview &amp; validate</button>
+          <button class="btn pri" data-act="csr-commit" disabled id="imp-commit">${ICON.check} Commit to Master DB</button>
+          <button class="btn" data-act="csr-template">${ICON.doc} Download template</button>
+          <div style="flex:1"></div>
+          <button class="btn" data-act="csr-export">${ICON.down} Export CSR ${esc(S.csr.fy)} · ${esc(S.csr.region)}</button>
+        </div>
+        <div id="imp-result" style="margin-top:12px"></div>
+      </div></div>` : ''}
+
+    <div class="card" style="margin-bottom:14px">
+      <div class="bd">
+        <div class="row">
+          <div style="min-width:190px"><label class="f">Financial year</label>
+            <select class="i" id="csr-fy">${fys.map((f) => `<option ${f === S.csr.fy ? 'selected' : ''}>${esc(f)}</option>`).join('')}</select></div>
+          <div style="min-width:190px"><label class="f">Region</label>
+            <select class="i" id="csr-region">${regions.map((r) => `<option ${r === S.csr.region ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></div>
+          <div style="flex:1;min-width:200px"><label class="f">Search code / description / tag</label>
+            <input class="i" id="csr-q" placeholder="e.g. 1-3-6, exhaust fan, earthing, LED street light" value="${esc(S.csr.q)}"></div>
+          <div style="min-width:150px"><label class="f">Chapter</label>
+            <select class="i" id="csr-chapter"><option value="">All chapters</option>
+            ${facets.chapters.map((c) => `<option value="${c.value}" ${String(S.csr.chapter) === String(c.value) ? 'selected' : ''}>${c.value} · ${esc(c.name)} (${c.count})</option>`).join('')}</select></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="chip ${!S.csr.category ? 'on' : ''}" data-act="csr-cat" data-v="">All heads (${list.total})</button>
+          ${facets.categories.map((c) => `<button class="chip ${S.csr.category === c.value ? 'on' : ''}" data-act="csr-cat" data-v="${esc(c.value)}">${esc(c.value)} · ${c.count}</button>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="hd"><h3>${list.total} items · CSR ${esc(S.csr.fy)} (${esc(S.csr.region)} region)</h3><div style="flex:1"></div>
+        <span class="badge">page ${S.csr.page + 1} of ${Math.max(1, Math.ceil(list.total / S.csr.limit))}</span></div>
+      <div class="bd tight scrollx">
+        <table class="tbl">
+          <thead><tr><th>Item code</th><th>Description (legal text from Master CSR)</th><th>Unit</th><th class="num">Rate (₹)</th><th>Head / Section</th></tr></thead>
+          <tbody>${list.items.map((it) => `
+            <tr data-act="csr-item" data-id="${it.id}" style="cursor:pointer">
+              <td><span class="pill-code">${esc(it.item_code)}</span>${it.is_new ? ' <span class="badge brand tiny">NEW</span>' : ''}</td>
+              <td class="small">${esc(it.short_desc || it.description)}</td>
+              <td class="nowrap">${esc(it.unit)}</td>
+              <td class="num mono">${inr(it.rate)}</td>
+              <td class="small muted">${esc(it.category || '')}<br><span class="tiny">${esc(it.section || '')}</span></td>
+            </tr>`).join('') || '<tr><td colspan="5" class="empty">No items match the filters.</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div class="bd row between">
+        <button class="btn sm" data-act="csr-page" data-p="${S.csr.page - 1}" ${S.csr.page <= 0 ? 'disabled' : ''}>← Previous</button>
+        <span class="muted small">Showing ${list.items.length} of ${list.total}</span>
+        <button class="btn sm" data-act="csr-page" data-p="${S.csr.page + 1}" ${(S.csr.page + 1) * S.csr.limit >= list.total ? 'disabled' : ''}>Next →</button>
+      </div>
+    </div>`;
+
+  const q = document.getElementById('csr-q');
+  if (q) q.addEventListener('input', debounce((e) => { S.csr.q = e.target.value; S.csr.page = 0; render(); }, 420));
+}
+
+async function csrItemSheet(id) {
+  const r = await api(`/api/csr/items?fy=${S.csr.fy}&region=${S.csr.region}&limit=300`);
+  const it = (r.items || []).find((x) => x.id === Number(id));
+  if (!it) { toast('Item not found in this CSR version', 'bad'); return; }
+  const full = await api(`/api/csr/items?fy=${S.csr.fy}&region=${S.csr.region}&q=${encodeURIComponent(it.item_code)}&limit=5`);
+  const item = (full.items || []).find((x) => x.item_code === it.item_code) || it;
+  sheet({
+    title: `CSR item ${item.item_code}`,
+    body: `
+      <div class="row" style="margin-bottom:10px">
+        <span class="badge brand">CSR ${esc(S.csr.fy)}</span>
+        <span class="badge">${esc(S.csr.region)} region</span>
+        <span class="badge info">${esc(item.category || '')}</span>
+        ${item.is_new ? '<span class="badge warn">New item</span>' : ''}
+      </div>
+      <div class="small" style="line-height:1.55">${esc(item.description)}</div>
+      <div class="hr"></div>
+      <div class="grid g2">
+        <div><div class="lbl muted tiny">Unit</div><b>${esc(item.unit)}</b></div>
+        <div><div class="lbl muted tiny">Completed rate</div><b>₹ ${inr(item.rate)}</b></div>
+        <div><div class="lbl muted tiny">Material</div>₹ ${inr(item.material_rate)}</div>
+        <div><div class="lbl muted tiny">Labour</div>₹ ${inr(item.labour_rate)}</div>
+        <div><div class="lbl muted tiny">Chapter</div>${esc(item.chapter || '')} — ${esc(item.section || '')}</div>
+        <div><div class="lbl muted tiny">Specification</div>${esc(item.spec_no || '—')}</div>
+      </div>
+      <div class="hr"></div>
+      <label class="f">Metadata tags (drive the “Extra Item” search)</label>
+      ${S.user.role === 'admin'
+        ? `<div class="row"><input class="i" id="tag-input" value="${esc((item.tags || []).join(', '))}" placeholder="Fan, Earthing, Safety">
+            <button class="btn pri sm" data-act="save-tags" data-id="${item.id}">Save tags</button></div>`
+        : `<div class="row">${(item.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join('') || '<span class="muted small">No tags</span>'}</div>`}
+      <div class="notice info" style="margin-top:12px">${ICON.sparkle}<div>Every estimate that references <b>${esc(item.item_code)}</b> will print this exact description, unit and rate on the Form-23 MB, regardless of what the uploaded PDF says.</div></div>`,
+  });
+}
+
+/* ------------------------------------------------------------ projects list */
+async function viewProjects(view) {
+  setTitle('Projects & Estimates', 'Create a work, import the Technical Sanction estimate, then verify at site');
+  const { projects } = await api('/api/projects');
+  view.innerHTML = `
+    <div class="row between" style="margin-bottom:12px">
+      <div class="muted small">${projects.length} work(s) visible to you · ${S.user.role === 'admin' ? 'all divisions (admin view)' : 'your sub-division'}</div>
+      <button class="btn pri" data-act="new-project">${ICON.plus} New project</button>
+    </div>
+    <div class="grid g-auto">
+      ${projects.map((p) => `
+        <div class="card item-card" style="cursor:pointer" data-act="open-project" data-id="${p.id}">
+          <div class="row between"><span class="pill-code">${esc(p.project_code)}</span>${badgeFor(p.status)}</div>
+          <div style="font-weight:650">${esc(p.name)}</div>
+          <div class="small muted">${esc(p.division || '')}<br>Engineer: ${esc(p.engineer_name || '—')}</div>
+          <div class="progress ${p.progress_pct < 35 ? 'warn' : ''}"><i style="width:${Math.min(100, p.progress_pct)}%"></i></div>
+          <div class="row between small">
+            <span>${p.items} items</span><span><b>${p.progress_pct}%</b> measured</span></div>
+          <div class="row between tiny muted">
+            <span>Estimate ₹ ${inr(p.tendered_amount, 0)}</span><span>MB ${esc(p.mb_no || '—')}</span></div>
+        </div>`).join('') || `<div class="card"><div class="empty">${ICON.folder}<div>No projects yet — create your first work.</div></div></div>`}
+    </div>`;
+}
+
+function newProjectSheet() {
+  const u = S.user || {};
+  sheet({
+    title: 'New project',
+    wide: true,
+    body: `
+      <div class="grid g2">
+        <div style="grid-column:1/-1"><label class="f">Name of work *</label>
+          <input class="i" id="np-name" placeholder="Electrical installation to ... building at ..."></div>
+        <div><label class="f">Scheme / head</label><input class="i" id="np-scheme" placeholder="District Annual Plan 2024-25"></div>
+        <div><label class="f">Name of agency</label><input class="i" id="np-agency" placeholder="M/s ..."></div>
+        <div><label class="f">Division</label><input class="i" id="np-div" value="${esc(u.division || '')}"></div>
+        <div><label class="f">Circle</label><input class="i" id="np-circle" value="${esc(u.circle || '')}"></div>
+        <div><label class="f">Region</label>
+          <select class="i" id="np-region">${['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option ${(u.region || '') === r ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
+        <div><label class="f">CSR financial year</label>
+          <select class="i" id="np-fy"><option>2025-26</option><option selected>2024-25</option><option>2023-24</option></select></div>
+        <div><label class="f">Estimate No.</label><input class="i" id="np-est" placeholder="EST/ELE/NSK/2024-25/017"></div>
+        <div><label class="f">Technical Sanction No.</label><input class="i" id="np-ts" placeholder="TS/ELE/NSK/2024-25/041"></div>
+        <div><label class="f">TS date</label><input class="i" id="np-tsdate" type="date"></div>
+        <div><label class="f">TS amount (₹)</label><input class="i" id="np-amt" type="number" placeholder="auto-filled from import"></div>
+        <div><label class="f">MB No.</label><input class="i" id="np-mb" value="MB-01"></div>
+        <div><label class="f">Agreement No.</label><input class="i" id="np-agr" placeholder="AG/ELE/..."></div>
+        <div style="grid-column:1/-1"><label class="f">Rooms / locations for joint measurement (one per line — “Floor | Room”)</label>
+          <textarea class="i" id="np-rooms" placeholder="Ground Floor | Head Master Cabin
+Ground Floor | Office Room 1
+First Floor | Class Room 1
+Terrace / External | Corridor & External Area"></textarea></div>
+      </div>`,
+    footer: `<button class="btn" data-act="close-sheet">Cancel</button><button class="btn pri" data-act="create-project">Create project</button>`,
+  });
+
+  document.querySelector('[data-act="create-project"]').addEventListener('click', async () => {
+    const val = (id) => (document.getElementById(id) || {}).value || '';
+    const name = val('np-name').trim();
+    if (name.length < 6) { toast('Please enter a proper name of work', 'bad'); return; }
+    const rooms = val('np-rooms').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+      const [a, b] = l.split('|').map((x) => (x || '').trim());
+      return b ? { floor: a, name: b } : { floor: '', name: a };
+    });
+    const payload = {
+      name, scheme: val('np-scheme'), agency: val('np-agency'), division: val('np-div'), circle: val('np-circle'),
+      region: val('np-region'), csr_fy: val('np-fy'), csr_region: val('np-region'),
+      estimate_no: val('np-est'), ts_no: val('np-ts'), ts_date: val('np-tsdate'),
+      ts_amount: Number(val('np-amt') || 0), mb_no: val('np-mb'), agreement_no: val('np-agr'), rooms,
+    };
+    try {
+      const r = await api('/api/projects', { method: 'POST', body: payload });
+      closeSheet(); toast('Project created — now import the estimate', 'ok');
+      location.hash = `#/project/${r.project_id}`;
+      S.proj.tab = 'import';
+      render();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+}
+
+/* ------------------------------------------------------------ project view */
+async function viewProject(view, id) {
+  if (!id) { view.innerHTML = `<div class="empty">No project selected</div>`; return; }
+  S.proj.id = id;
+  const [p, checklist] = await Promise.all([
+    api(`/api/projects/${id}`), api(`/api/projects/${id}/checklist${S.proj.room ? '?room_id=' + S.proj.room : ''}`)]);
+  S.proj.data = p;
+  const pr = p.project;
+  setTitle(pr.name, `${pr.project_code} · ${pr.division || ''}`);
+  const tab = S.proj.tab;
+  view.innerHTML = `
+    <div class="card" style="margin-bottom:14px">
+      <div class="bd">
+        <div class="row between" style="align-items:flex-start">
+          <div style="min-width:260px;flex:1">
+            <div class="row"><span class="pill-code">${esc(pr.project_code)}</span>${badgeFor(pr.status)}
+              <span class="badge brand">CSR ${esc(pr.csr_fy)} · ${esc(pr.csr_region)}</span>
+              ${p.non_schedule_items ? `<span class="badge ns">${p.non_schedule_items} non-schedule</span>` : ''}</div>
+            <div class="small muted" style="margin-top:6px">
+              TS: ${esc(pr.ts_no || '—')} dt. ${dt(pr.ts_date)} · Estimate: ${esc(pr.estimate_no || '—')} ·
+              MB ${esc(pr.mb_no || '—')} · Agreement ${esc(pr.agreement_no || '—')}</div>
+          </div>
+          <div class="row">
+            <button class="btn" data-act="gen" data-fmt="xlsx">${ICON.doc} Excel MB</button>
+            <button class="btn pri" data-act="gen" data-fmt="pdf">${ICON.doc} Form-23 MB (PDF)</button>
+          </div>
+        </div>
+        <div class="grid g4" style="margin-top:14px">
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Checklist items</div><div class="val sm">${p.items}</div>
+            <div class="foot">${p.items_measured} measured · ${p.items_pending} pending</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Tendered (estimate)</div><div class="val sm">₹ ${inr(p.tendered_amount, 0)}</div>
+            <div class="foot">${p.rooms} rooms · ${p.photos} site photos</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Measured value</div><div class="val sm">₹ ${inr(p.measured_amount, 0)}</div>
+            <div class="foot">${p.measurement_rows} measurement rows</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Net deviation</div>
+            <div class="val sm" style="color:${p.net_deviation >= 0 ? 'var(--bad)' : 'var(--ok)'}">${p.net_deviation >= 0 ? '+' : '−'} ₹ ${inr(Math.abs(p.net_deviation), 0)}</div>
+            <div class="foot">${p.critical_deviations} item(s) beyond ±10%</div></div>
+        </div>
+        <div class="progress" style="margin-top:12px"><i style="width:${Math.min(100, p.progress_pct)}%"></i></div>
+      </div>
+      <div class="bd tight" style="padding:10px 12px">
+        <div class="tabs" id="ptabs">
+          ${[['overview', 'Overview'], ['import', 'Smart Import'], ['checklist', `Checklist (${checklist.totals.done}/${checklist.totals.items})`],
+      ['measurements', 'Measurements'], ['deviations', `Deviations (${p.critical_deviations})`], ['reports', 'Form-23 & Reports']]
+      .map(([k, l]) => `<button data-act="ptab" data-t="${k}" class="${tab === k ? 'on' : ''}">${l}</button>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div id="tabbody"></div>`;
+  const body = document.getElementById('tabbody');
+  if (!body) return;
+  body.innerHTML = loading();
+  if (tab === 'overview') return tabOverview(body, p, checklist);
+  if (tab === 'import') return tabImport(body, p);
+  if (tab === 'checklist') return tabChecklist(body, p, checklist);
+  if (tab === 'measurements') return tabMeasurements(body, p);
+  if (tab === 'deviations') return tabDeviations(body, p);
+  if (tab === 'reports') return tabReports(body, p);
+}
+
+async function tabOverview(body, p, checklist) {
+  const pr = p.project;
+  const dev = await api(`/api/projects/${p.project.id}/deviations`);
+  const critical = dev.rows.filter((r) => r.severity === 'critical' || r.severity === 'review').slice(0, 6);
+  body.innerHTML = `
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="hd"><h3>Work particulars</h3></div>
+        <div class="bd">
+          <div class="stat-line"><span>Name of work</span><b style="text-align:right">${esc(pr.name)}</b></div>
+          <div class="stat-line"><span>Scheme / head</span><span>${esc(pr.scheme || '—')}</span></div>
+          <div class="stat-line"><span>Agency</span><span>${esc(pr.agency || '—')}</span></div>
+          <div class="stat-line"><span>Division / Circle</span><span>${esc(pr.division || '—')} / ${esc(pr.circle || '—')}</span></div>
+          <div class="stat-line"><span>Estimate No.</span><span>${esc(pr.estimate_no || '—')}</span></div>
+          <div class="stat-line"><span>Technical Sanction</span><span>${esc(pr.ts_no || '—')} · ${dt(pr.ts_date)}</span></div>
+          <div class="stat-line"><span>Agreement</span><span>${esc(pr.agreement_no || '—')}</span></div>
+          <div class="stat-line"><span>MB No. / CSR</span><span>${esc(pr.mb_no || '—')} / ${esc(pr.csr_fy)} ${esc(pr.csr_region)}</span></div>
+          <div class="stat-line"><span>Engineer in charge</span><span>${esc((p.team && p.team.name) || '—')}</span></div>
+          <div class="hr"></div>
+          <div class="row between">
+            <span class="tiny muted">Danger zone — deletes the project with its checklist, measurements and photos.</span>
+            <button class="btn sm danger" data-act="del-project" data-id="${pr.id}">Delete project</button>
+          </div>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="card">
+          <div class="hd"><h3>Measurement progress by location</h3><div style="flex:1"></div>
+            <button class="btn sm" data-act="add-room">${ICON.plus} Room</button></div>
+          <div class="bd stack">
+            ${checklist.rooms.length ? checklist.rooms.map((r) => `
+              <div class="stat-line"><span>${esc(r.floor ? r.floor + ' · ' : '')}${esc(r.name)}</span>
+                <span class="small">${r.items_touched} item(s) · <b>${smartNum(r.qty)}</b> qty recorded</span></div>`).join('')
+      : '<div class="muted small">No rooms yet — add rooms to group measurements like the MB.</div>'}
+          </div>
+        </div>
+        <div class="card">
+          <div class="hd"><h3>Deviation alerts</h3><div style="flex:1"></div>
+            <span class="badge ${critical.length ? 'bad' : 'ok'}">${critical.length ? critical.length + ' to review' : 'all within limits'}</span></div>
+          <div class="bd stack">
+            ${critical.length ? critical.map((r) => `
+              <div class="stat-line"><span><span class="pill-code">${esc(r.item_code)}</span> ${esc((r.description || '').slice(0, 52))}…</span>
+                <span class="nowrap ${r.dev_qty > 0 ? 'badge bad' : 'badge ok'}">${r.dev_qty > 0 ? '+' : ''}${smartNum(r.dev_qty)} ${esc(r.unit)} (${r.dev_pct}%)</span></div>`).join('')
+      : '<div class="muted small">No item crosses the ±10% variation limit. Excess/savings statement is generated with the MB.</div>'}
+            <div class="row" style="margin-top:6px">
+              <span class="badge ok">Savings ₹ ${inr(dev.totals.saving_amount, 0)}</span>
+              <span class="badge bad">Excess ₹ ${inr(dev.totals.excess_amount, 0)}</span>
+              <span class="badge brand">Net ₹ ${inr(dev.totals.net_amount, 0)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function tabImport(body, p) {
+  const pr = p.project;
+  body.innerHTML = `
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="hd">${ICON.sparkle}<h3>Upload Technical Sanction estimate</h3></div>
+        <div class="bd stack">
+          <div class="notice info">${ICON.shield}<div>Descriptions and rates are taken from the <b>Master CSR ${esc(pr.csr_fy)} (${esc(pr.csr_region)})</b>. Only the item codes and quantities are read from your estimate — so a blurry or badly formatted PDF cannot corrupt the legal text.</div></div>
+          <div><label class="f">Estimate file (PDF / Excel / CSV)</label><input class="i" type="file" id="est-file" accept=".pdf,.xlsx,.xlsm,.csv,.txt"></div>
+          <div class="row">
+            <button class="btn pri" data-act="parse-file">${ICON.up} Parse estimate</button>
+            <button class="btn" data-act="sample-file">Try sample estimate</button>
+          </div>
+          <div class="hr"></div>
+          <label class="f">…or paste the estimate / abstract text (works on mobile)</label>
+          <textarea class="i" id="est-text" placeholder="1-9-1  Concealed type light point wiring with 1.5 sq.mm ...  Point  84
+1-3-6  S&E mains with 3x4 sq.mm FRLSH copper PVC insulated wire  m  190
+6-2-4  S&F RCCB double pole 40A 30 mA  No  6"></textarea>
+          <button class="btn" data-act="parse-text">${ICON.sparkle} Parse pasted text</button>
+          <div id="parse-note"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>How the Smart Map works</h3></div>
+        <div class="bd small stack">
+          <div><b>1 · Anchor-based extraction</b><div class="muted">The parser hunts for the item-number pattern <code class="kbd">^\\d+-\\d+-\\d+$</code> anywhere in the document, repairs OCR artefacts (O→0, l→1, S→5) and then looks for the quantity column.</div></div>
+          <div><b>2 · Master lookup</b><div class="muted">If the anchor exists in the Master CSR, the description/unit/rate are taken from the database — the PDF text is ignored. PDF text is used only as a fallback for non-schedule items.</div></div>
+          <div><b>3 · Reconciliation</b><div class="muted">Findings vs Master DB: matched · unit mismatch · low confidence · <b>Unknown_Item</b> (flagged for manual entry).</div></div>
+          <div><b>4 · Checklist</b><div class="muted">Confirmed items become the mobile measurement checklist, grouped by room.</div></div>
+          <div class="hr"></div>
+          <button class="btn sm" data-act="show-prompt">${ICON.doc} View the parsing-engine prompt</button>
+        </div>
+      </div>
+    </div>
+    <div id="import-result" style="margin-top:14px"></div>`;
+
+  const f = body.querySelector('#est-file');
+  const t = body.querySelector('#est-text');
+  body.querySelector('[data-act="parse-file"]')?.addEventListener('click', async () => {
+    if (!f || !f.files || !f.files[0]) { toast('Choose the estimate PDF/Excel/CSV first', 'bad'); return; }
+    await runParse({ file: f.files[0] });
+  });
+  body.querySelector('[data-act="parse-text"]')?.addEventListener('click', async () => {
+    const text = (t && t.value || '').trim();
+    if (text.length < 10) { toast('Paste at least a couple of estimate rows', 'bad'); return; }
+    await runParse({ text });
+  });
+  body.querySelector('[data-act="sample-file"]')?.addEventListener('click', async () => {
+    const sample = await fetch('/api/samples/sample_estimate.xlsx').then((r) => r.blob())
+      .then((b) => new File([b], 'sample_estimate.xlsx')).catch(() => null);
+    if (!sample) { toast('Sample file not reachable — use paste mode instead', 'warn'); return; }
+    await runParse({ file: sample });
+  });
+  if (S.importPreview) renderImportPreview(S.importPreview);
+}
+
+async function runParse({ file, text }) {
+  const res = document.getElementById('import-result');
+  res.innerHTML = loading('Parsing estimate — anchors, quantities, master lookup…');
+  try {
+    let data;
+    if (file) {
+      const fd = new FormData(); fd.append('file', file); fd.append('engine', 'anchor');
+      data = await api(`/api/projects/${S.proj.id}/parse-estimate`, { method: 'POST', form: fd });
+    } else {
+      data = await api(`/api/projects/${S.proj.id}/parse-text`, { method: 'POST', body: { text } });
+    }
+    S.importPreview = data;
+    renderImportPreview(data);
+    toast(`Parsed ${data.stats.unique_codes} item codes · ${data.stats.matched} matched`, 'ok');
+  } catch (e) {
+    res.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>Parsing failed.</b><br>${esc(e.message)}</div></div>`;
+  }
+}
+
+function renderImportPreview(data) {
+  const res = document.getElementById('import-result');
+  const rows = data.rows || [];
+  const st = data.stats || {};
+  res.innerHTML = `
+    <div class="card">
+      <div class="hd">${ICON.check}<h3>Reconciliation preview</h3><div style="flex:1"></div>
+        <span class="badge ok">${st.matched || 0} matched</span>
+        <span class="badge ${st.unknown ? 'ns' : ''}">${st.unknown || 0} non-schedule</span>
+        ${st.low_confidence ? `<span class="badge warn">${st.low_confidence} low confidence</span>` : ''}
+        ${st.duplicates ? `<span class="badge">${st.duplicates} duplicate anchor merged</span>` : ''}
+      </div>
+      <div class="bd">
+        <div class="notice ${st.unknown ? 'warn' : 'ok'}">${ICON.sparkle}<div>
+          Found <b>${st.anchors_found}</b> anchors (${st.unique_codes} unique item codes) in <b>${esc(data.filename || 'input')}</b>.
+          <b>${st.matched}</b> matched the Master CSR database${st.unknown ? ` and <b>${st.unknown}</b> item(s) are <b>Unknown_Item</b> — give them a description and rate to add them as non-schedule items` : ' — nothing needs manual entry'}.
+          Estimated value at CSR rates: <b>₹ ${inr(st.estimated_amount)}</b>.
+          <br><span class="tiny">${esc(data.engine_note || '')}</span>
+        </div></div>
+        <div class="row" style="margin:10px 0">
+          <button class="btn pri" data-act="confirm-import">${ICON.check} Confirm &amp; generate measurement checklist</button>
+          <button class="btn" data-act="toggle-all-import">Select / deselect all</button>
+          <label class="row small" style="gap:6px"><input type="checkbox" id="auto-rooms" checked> auto-create rooms from the estimate text</label>
+          <div style="flex:1"></div>
+          <span class="muted small">${rows.filter((r) => r.include).length} of ${rows.length} rows selected</span>
+        </div>
+      </div>
+      <div class="bd tight scrollx">
+        <table class="tbl" id="imp-table">
+          <thead><tr><th></th><th>Printed code</th><th>Master code</th><th>Description (editable for non-schedule)</th>
+            <th>Unit</th><th class="num">Qty</th><th class="num">Rate (₹)</th><th>Status &amp; flags</th></tr></thead>
+          <tbody>${rows.map((r, i) => `
+            <tr data-row="${i}">
+              <td><input type="checkbox" data-act="inc" data-i="${i}" ${r.include ? 'checked' : ''}></td>
+              <td class="mono small">${esc(r.printed_code)}${r.printed_code !== r.item_code ? `<br><span class="tiny muted">→ ${esc(r.item_code)}</span>` : ''}</td>
+              <td><span class="pill-code">${esc(r.item_code)}</span></td>
+              <td class="small">${r.is_non_schedule
+      ? `<textarea class="i" style="min-height:52px;font-family:inherit" data-act="desc" data-i="${i}">${esc(r.description)}</textarea>`
+      : esc((r.description || '').slice(0, 150)) + (r.description.length > 150 ? '…' : '')}</td>
+              <td class="nowrap small">${esc(r.unit)}</td>
+              <td class="num"><input class="i right" style="padding:5px 7px;min-width:74px" type="number" step="0.001" data-act="qty" data-i="${i}" value="${r.tendered_qty != null ? r.tendered_qty : ''}"></td>
+              <td class="num">${r.is_non_schedule
+      ? `<input class="i right" style="padding:5px 7px;min-width:80px" type="number" step="0.01" data-act="rate" data-i="${i}" value="${r.rate || ''}">`
+      : inr(r.rate)}</td>
+              <td class="small">${badgeFor(r.status)}
+                ${(r.flags || []).map((f) => `<div class="tiny muted">• ${esc(f)}</div>`).join('')}
+                <div class="tiny muted">conf ${(r.confidence * 100).toFixed(0)}% · ${esc(r.method || '')}${r.line_no ? ' · line ' + r.line_no : ''}</div></td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div class="bd">
+        <details><summary class="small muted">Show extracted text (first 6 000 characters)</summary>
+          <pre class="mono tiny" style="max-height:260px;overflow:auto;background:#0f172a;color:#cbd5e1;padding:12px;border-radius:10px">${esc(data.text_excerpt || '')}</pre>
+        </details>
+      </div>
+    </div>`;
+
+  res.querySelectorAll('[data-act="inc"]').forEach((cb) => cb.addEventListener('change', (e) => {
+    rows[Number(e.target.dataset.i)].include = e.target.checked;
+  }));
+  res.querySelectorAll('[data-act="qty"]').forEach((inp) => inp.addEventListener('change', (e) => {
+    const r = rows[Number(e.target.dataset.i)];
+    r.tendered_qty = Number(e.target.value || 0); r.pdf_qty = r.tendered_qty;
+  }));
+  res.querySelectorAll('[data-act="rate"]').forEach((inp) => inp.addEventListener('change', (e) => {
+    rows[Number(e.target.dataset.i)].rate = Number(e.target.value || 0);
+  }));
+  res.querySelectorAll('[data-act="desc"]').forEach((ta) => ta.addEventListener('change', (e) => {
+    rows[Number(e.target.dataset.i)].description = e.target.value;
+  }));
+  res.querySelector('[data-act="confirm-import"]')?.addEventListener('click', async () => {
+    const autoRooms = !!res.querySelector('#auto-rooms')?.checked;
+    try {
+      const r = await api(`/api/projects/${S.proj.id}/import-estimate`,
+        { method: 'POST', body: { rows, create_rooms_from_text: autoRooms } });
+      toast(`Checklist generated — ${r.created.length} item(s) added${r.skipped.length ? `, ${r.skipped.length} skipped` : ''}`, 'ok');
+      S.importPreview = null; S.proj.tab = 'checklist'; render();
+    } catch (e) { toast(e.message, 'bad'); }
+  });
+  res.querySelector('[data-act="toggle-all-import"]')?.addEventListener('click', () => {
+    const anyOff = rows.some((r) => !r.include);
+    rows.forEach((r) => { r.include = anyOff; });
+    renderImportPreview(data);
+  });
+}
+
+async function tabChecklist(body, p, cl) {
+  const rooms = cl.rooms;
+  const items = cl.items;
+  body.innerHTML = `
+    <div class="card" style="margin-bottom:12px">
+      <div class="bd row between">
+        <div class="row" style="overflow-x:auto;flex-wrap:nowrap;max-width:100%">
+          <button class="chip ${!S.proj.room ? 'on' : ''}" data-act="room" data-id="">All locations</button>
+          ${rooms.map((r) => `<button class="chip ${S.proj.room === r.id ? 'on' : ''}" data-act="room" data-id="${r.id}">
+            ${esc(r.floor ? r.floor + ' · ' : '')}${esc(r.name)} ${r.rows_count ? `<span class="badge ok tiny">${smartNum(r.qty)}</span>` : ''}</button>`).join('')}
+          <button class="chip ghost" data-act="add-room">${ICON.plus} Add room</button>
+        </div>
+        <div class="row">
+          <button class="btn pri" data-act="extra-item">${ICON.plus} Extra / additional item</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="hd"><h3>Measurement checklist ${S.proj.room ? '· ' + esc((rooms.find((r) => r.id === S.proj.room) || {}).name || '') : ''}</h3>
+        <div style="flex:1"></div><span class="badge ${cl.totals.done === cl.totals.items ? 'ok' : 'warn'}">${cl.totals.done}/${cl.totals.items} started</span>
+        <span class="badge brand">${cl.totals.fully} fully measured</span></div>
+      <div class="bd stack">
+        ${items.length ? items.map((it) => {
+    const pct = it.tendered_qty ? Math.min(100, (it.measured_qty / it.tendered_qty) * 100) : (it.measured_qty ? 100 : 0);
+    const cls = it.measured_qty > it.tendered_qty + 1e-6 ? 'excess' : it.done ? 'done' : 'pending';
+    return `
+          <div class="item-card ${cls}">
+            <div class="row between">
+              <div class="row" style="min-width:0">
+                <span class="pill-code">${esc(it.item_code)}</span>
+                ${it.is_non_schedule ? '<span class="badge ns">Non-schedule</span>' : ''}
+                ${it.source === 'extra' ? '<span class="badge info">Extra item</span>' : ''}
+                ${it.measured_qty > it.tendered_qty + 1e-6 ? '<span class="badge bad">Excess</span>' : ''}
+                ${it.fully_measured ? '<span class="badge ok">Complete</span>' : ''}
+              </div>
+              <button class="btn sm pri" data-act="measure" data-id="${it.id}">${ICON.ruler} Measure</button>
+            </div>
+            <div class="small">${esc(it.description)}</div>
+            <div class="progress ${pct < 34 ? 'warn' : ''}"><i style="width:${pct}%"></i></div>
+            <div class="row between tiny muted">
+              <span>Tendered <b>${smartNum(it.tendered_qty)}</b> ${esc(it.unit)} · measured <b>${smartNum(it.measured_qty)}</b> · pending <b>${smartNum(it.pending_qty)}</b></span>
+              <span>₹ ${inr(it.rate)} / ${esc(it.unit)} · value ₹ ${inr(it.measured_qty * it.rate, 0)}</span>
+            </div>
+          </div>`;
+  }).join('') : `<div class="empty">${ICON.ruler}<div>No checklist items yet.<br>Import the Technical Sanction estimate from the <b>Smart Import</b> tab.</div></div>`}
+      </div>
+    </div>`;
+}
+
+async function tabMeasurements(body, p) {
+  const { measurements, count, total_amount } = await api(`/api/projects/${S.proj.id}/measurements`);
+  const grouped = {};
+  measurements.forEach((m) => { const k = m.room_name || 'Unassigned'; (grouped[k] = grouped[k] || []).push(m); });
+  body.innerHTML = `
+    <div class="row between" style="margin-bottom:12px">
+      <div class="muted small">${count} measurement entries · valued ₹ ${inr(total_amount)} at CSR rates</div>
+      <button class="btn" data-act="gen" data-fmt="xlsx">${ICON.down} Excel MB</button>
+    </div>
+    ${Object.keys(grouped).length ? Object.entries(grouped).map(([room, rows]) => `
+      <div class="card" style="margin-bottom:12px">
+        <div class="hd">${ICON.ruler}<h3>${esc(room)}</h3><div style="flex:1"></div>
+          <span class="badge">${rows.length} entries</span>
+          <span class="badge brand">₹ ${inr(rows.reduce((a, r) => a + r.amount, 0), 0)}</span></div>
+        <div class="bd tight scrollx">
+          <table class="tbl"><thead><tr><th>Date</th><th>Item</th><th>Description</th><th class="num">No</th><th class="num">L</th>
+            <th class="num">B</th><th class="num">H</th><th class="num">Qty</th><th class="num">Amount</th><th>Photos</th><th></th></tr></thead>
+          <tbody>${rows.map((m) => `
+            <tr><td class="small nowrap">${dt(m.measured_on)}</td>
+              <td><span class="pill-code">${esc(m.item_code)}</span></td>
+              <td class="small">${esc((m.description || '').slice(0, 70))}</td>
+              <td class="num">${smartNum(m.nos)}</td><td class="num">${smartNum(m.length)}</td>
+              <td class="num">${smartNum(m.breadth)}</td><td class="num">${smartNum(m.height)}</td>
+              <td class="num"><b>${smartNum(m.measured_qty)}</b> ${esc(m.unit)}</td>
+              <td class="num">₹ ${inr(m.amount, 0)}</td>
+              <td class="nowrap">${m.photos ? `<button class="btn sm" data-act="gallery" data-id="${m.id}">${ICON.cam} ${m.photos}</button>` : ''}
+                <button class="btn sm" data-act="photo" data-id="${m.id}" title="Attach site photo">${ICON.plus}${ICON.cam}</button></td>
+              <td class="nowrap">
+                <button class="btn sm" data-act="edit-meas" data-id="${m.id}">Edit</button>
+                <button class="btn sm danger" data-act="del-meas" data-id="${m.id}">Del</button></td></tr>`).join('')}
+          </tbody></table>
+        </div>
+      </div>`).join('') : `<div class="card"><div class="empty">${ICON.ruler}<div>No measurements recorded yet.<br>Open the <b>Checklist</b> tab and tap <b>Measure</b> against an item.</div></div></div>`}`;
+}
+
+async function tabDeviations(body, p) {
+  const d = await api(`/api/projects/${S.proj.id}/deviations`);
+  const t = d.totals;
+  body.innerHTML = `
+    <div class="grid g4" style="margin-bottom:12px">
+      <div class="card kpi"><div class="lbl">Tendered value</div><div class="val sm">₹ ${inr(t.tendered_amount, 0)}</div><div class="foot">as per TS estimate</div></div>
+      <div class="card kpi"><div class="lbl">Measured value</div><div class="val sm">₹ ${inr(t.measured_amount, 0)}</div><div class="foot">at Master CSR rates</div></div>
+      <div class="card kpi"><div class="lbl">Excess</div><div class="val sm" style="color:var(--bad)">₹ ${inr(t.excess_amount, 0)}</div><div class="foot">${t.critical.length} item(s) need variation approval</div></div>
+      <div class="card kpi"><div class="lbl">Savings</div><div class="val sm" style="color:var(--ok)">₹ ${inr(t.saving_amount, 0)}</div><div class="foot">net ₹ ${inr(t.net_amount, 0)}</div></div>
+    </div>
+    <div class="card">
+      <div class="hd">${ICON.chart}<h3>Item-wise deviation — measured vs tendered</h3></div>
+      <div class="bd tight scrollx">
+        <table class="tbl">
+          <thead><tr><th>Item code</th><th>Description</th><th>Unit</th><th class="num">Rate</th><th class="num">Tendered</th>
+            <th class="num">Measured</th><th class="num">Deviation</th><th class="num">%</th><th class="num">Excess / Saving (₹)</th><th></th></tr></thead>
+          <tbody>${d.rows.map((r) => `
+            <tr>
+              <td><span class="pill-code">${esc(r.item_code)}</span></td>
+              <td class="small">${esc((r.description || '').slice(0, 88))}${r.is_non_schedule ? ' <span class="badge ns tiny">NS</span>' : ''}</td>
+              <td class="nowrap">${esc(r.unit)}</td>
+              <td class="num mono">${inr(r.rate)}</td>
+              <td class="num">${smartNum(r.tendered)}</td>
+              <td class="num"><b>${smartNum(r.measured)}</b></td>
+              <td class="num" style="color:${r.dev_qty > 0 ? 'var(--bad)' : r.dev_qty < 0 ? 'var(--ok)' : 'inherit'}">${r.dev_qty > 0 ? '+' : ''}${smartNum(r.dev_qty)}</td>
+              <td class="num">${r.dev_pct > 0 ? '+' : ''}${r.dev_pct}%</td>
+              <td class="num" style="color:${r.dev_amount > 0 ? 'var(--bad)' : 'var(--ok)'}">${r.dev_amount > 0 ? '+' : ''}${inr(r.dev_amount, 0)}</td>
+              <td>${r.severity === 'critical' ? '<span class="badge bad">Approval</span>' : r.severity === 'review' ? '<span class="badge warn">Review</span>' : badgeFor(r.status)}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div class="bd small muted">Excess beyond the permissible variation limit requires a formal variation / excess-item approval before the quantity is entered in the final bill. Savings are recouped automatically.</div>
+    </div>`;
+}
+
+async function tabReports(body, p) {
+  const pr = p.project;
+  const cl = await api(`/api/projects/${p.project.id}/checklist`);
+  body.innerHTML = `
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="hd">${ICON.doc}<h3>Form No. 23 — Measurement Book</h3></div>
+        <div class="bd stack">
+          <div class="notice ok">${ICON.check}<div>The MB is generated from the <b>Master CSR descriptions</b>, so the legal text is clean even when the source estimate was a bad scan. Item heads show the CSR code; sub-entries show the location (room) and the joint-measurement dimensions.</div></div>
+          <div class="stat-line"><span>Work</span><b style="text-align:right">${esc(pr.name)}</b></div>
+          <div class="stat-line"><span>MB No. / Agreement</span><span>${esc(pr.mb_no || '—')} / ${esc(pr.agreement_no || '—')}</span></div>
+          <div class="stat-line"><span>Measurement period</span><span>${dt(pr.created_at)} → today</span></div>
+          <div class="stat-line"><span>Items measured</span><span>${cl.totals.done} of ${cl.totals.items}</span></div>
+          <div class="row">
+            <button class="btn pri" data-act="dl" data-path="/api/projects/${pr.id}/form23.pdf" data-name="Form23_MB_${esc(pr.mb_no || pr.id)}.pdf">${ICON.down} Form-23 PDF (with deviation statement)</button>
+            <button class="btn" data-act="dl" data-path="/api/projects/${pr.id}/form23.xlsx" data-name="Form23_MB_${esc(pr.mb_no || pr.id)}.xlsx">${ICON.down} Excel MB (3 sheets)</button>
+            <button class="btn" data-act="dl" data-path="/api/projects/${pr.id}/form23.pdf?measured_only=true" data-name="Form23_MB_measured_only.pdf">Measured items only</button>
+          </div>
+          <div class="hint">PDF carries: work particulars, item-wise measurement table in MB column format (No · L · B · H · Qty · Rate · Amount), grand total, deviation statement and the four signature blocks (JE / DE / Contractor / EE).</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>Report readiness</h3></div>
+        <div class="bd stack small">
+          <div class="stat-line"><span>Estimate items on checklist</span><b>${p.items}</b></div>
+          <div class="stat-line"><span>Items with measurements</span><b>${p.items_measured}</b></div>
+          <div class="stat-line"><span>Pending items</span><b>${p.items_pending}</b></div>
+          <div class="stat-line"><span>Non-schedule items</span><b>${p.non_schedule_items}</b></div>
+          <div class="stat-line"><span>Site photographs</span><b>${p.photos}</b></div>
+          <div class="stat-line"><span>Critical deviations</span><b>${p.critical_deviations}</b></div>
+          <div class="hr"></div>
+          ${p.items_pending ? `<div class="notice warn">${ICON.warn}<div>${p.items_pending} item(s) have no measurement yet — they will print as “Not yet measured / nil” in the MB.</div></div>` : `<div class="notice ok">${ICON.check}<div>All checklist items carry measurements. The MB is ready for checking.</div></div>`}
+          <div class="hr"></div>
+          <div class="muted">Excel export contains three sheets: <b>Form-23 Measurements</b>, <b>Deviation Statement</b> and <b>Estimate Items</b> (with match method + confidence for audit).</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ------------------------------------------------------- measurement capture */
+function measureSheet(itemId, editRow) {
+  sheet({
+    title: editRow ? 'Edit measurement' : 'Record joint measurement',
+    body: `<div id="ms-body">${loading('Loading item…')}</div>`,
+    footer: `<button class="btn" data-act="close-sheet">Cancel</button>
+      <button class="btn pri" id="ms-save" disabled>${editRow ? 'Update measurement' : 'Save measurement'}</button>`,
+    onOpen: (el) => { el._saveBtn = el.querySelector('#ms-save'); },
+  });
+  (async () => {
+    const cl = await api(`/api/projects/${S.proj.id}/checklist`);
+    const item = (cl.items || []).find((x) => x.id === itemId);
+    const rooms = cl.rooms || [];
+    if (!item && !editRow) { document.getElementById('ms-body').innerHTML = '<div class="notice bad">Item not found</div>'; return; }
+    const unit = (editRow && editRow.unit) || item.unit;
+    const u = (unit || '').toLowerCase();
+    const isLen = u === 'm' || u === 'kg' || u === 'rm';
+    const rows = editRow || { nos: 1, length: 0, breadth: 0, height: 0, notes: '', measured_on: today(), room_id: S.proj.room || (rooms[0] && rooms[0].id) };
+    document.getElementById('ms-body').innerHTML = `
+      <div class="row" style="margin-bottom:10px">
+        <span class="pill-code">${esc((editRow && editRow.item_code) || item.item_code)}</span>
+        <span class="badge brand">${esc(unit)}</span>
+        ${item ? `<span class="badge">Tendered ${smartNum(item.tendered_qty)}</span>` : ''}
+      </div>
+      <div class="small" style="margin-bottom:12px">${esc((editRow && editRow.description) || item.description)}</div>
+      <div class="row" style="margin-bottom:10px">
+        <div style="flex:1"><label class="f">Location / room</label>
+          <select class="i" id="ms-room">
+            <option value="">— unassigned —</option>
+            ${rooms.map((r) => `<option value="${r.id}" ${String(rows.room_id) === String(r.id) ? 'selected' : ''}>${esc(r.floor ? r.floor + ' · ' : '')}${esc(r.name)}</option>`).join('')}
+          </select></div>
+        <div><label class="f">Measured on</label><input class="i" id="ms-date" type="date" value="${rows.measured_on || today()}"></div>
+      </div>
+      <div class="grid ${isLen ? 'g2' : 'g3'}">
+        <div><label class="f">${isLen ? 'Length (m)' : 'No. / count'}</label>
+          <input class="i" id="ms-a" type="number" step="0.01" value="${isLen ? (rows.length || '') : (rows.nos || 1)}"></div>
+        ${isLen ? `<div><label class="f">No. of runs / sets</label><input class="i" id="ms-nos" type="number" step="1" value="${rows.nos || 1}"></div>` : ''}
+        ${!isLen ? `<div><label class="f">Length (m)</label><input class="i" id="ms-l" type="number" step="0.01" value="${rows.length || ''}"></div>
+                    <div><label class="f">Breadth (m)</label><input class="i" id="ms-b" type="number" step="0.01" value="${rows.breadth || ''}"></div>` : ''}
+      </div>
+      <div class="notice info" style="margin:12px 0">${ICON.ruler}<div>Quantity is computed from the MB columns and can be overridden if the site measurement follows a different basis.</div></div>
+      <label class="f">Computed quantity (${esc(unit)}) — editable override</label>
+      <input class="i" id="ms-qty" type="number" step="0.001" value="${rows.measured_qty || ''}" placeholder="auto">
+      <div style="margin-top:10px"><label class="f">Joint measurement note</label>
+        <textarea class="i" style="min-height:64px;font-family:inherit" id="ms-notes" placeholder="e.g. measured in presence of contractor representative; cable route as per approved drawing">${esc(rows.notes || '')}</textarea></div>
+      <div style="margin-top:10px"><label class="f">Site photograph (optional)</label>
+        <input class="i" type="file" id="ms-photo" accept="image/*" capture="environment"></div>`;
+    const calc = () => {
+      const g = (x) => Number((document.getElementById(x) || {}).value || 0);
+      const q = isLen ? g('ms-a') * (g('ms-nos') || 1) : ((g('ms-l') || 0) > 0 ? (g('ms-a') || 0) * g('ms-l') * ((g('ms-b') || 1) || 1) : g('ms-a'));
+      if (!document.getElementById('ms-qty').dataset.touched) document.getElementById('ms-qty').value = q ? Number(q.toFixed(3)) : '';
+    };
+    ['ms-a', 'ms-l', 'ms-b', 'ms-nos'].forEach((id) => {
+      const el = document.getElementById(id); if (el) el.addEventListener('input', calc);
+    });
+    document.getElementById('ms-qty').addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
+    const saveBtn = document.getElementById('ms-save');
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.addEventListener('click', async () => {
+      const g = (x) => Number((document.getElementById(x) || {}).value || 0);
+      const val = (x) => (document.getElementById(x) || {}).value || '';
+      const payload = {
+        project_item_id: itemId, room_id: val('ms-room') ? Number(val('ms-room')) : null,
+        nos: isLen ? (g('ms-nos') || 1) : (g('ms-a') || 0),
+        length: isLen ? g('ms-a') : g('ms-l'), breadth: isLen ? 0 : g('ms-b'), height: 0,
+        notes: val('ms-notes'), measured_on: val('ms-date'),
+        measured_qty: val('ms-qty') ? Number(val('ms-qty')) : null,
+      };
+      try {
+        let mid;
+        if (editRow) { await api(`/api/measurements/${editRow.id}`, { method: 'PATCH', body: payload }); mid = editRow.id; }
+        else {
+          const r = await api('/api/measurements', { method: 'POST', body: payload });
+          mid = r.measurement_id;
+          toast(`Recorded ${smartNum(r.measured_qty)} ${unit} · item total ${smartNum(r.item_total_qty)} (tendered ${smartNum(r.tendered_qty)})`,
+            Math.abs(r.deviation) > 1e-6 ? 'warn' : 'ok', 5000);
+        }
+        const ph = document.getElementById('ms-photo');
+        if (ph && ph.files && ph.files[0]) {
+          const fd = new FormData(); fd.append('file', ph.files[0]); fd.append('caption', 'Site evidence');
+          await api(`/api/measurements/${mid}/photos`, { method: 'POST', form: fd });
+        }
+        closeSheet(); render();
+      } catch (e) { toast(e.message, 'bad'); }
+    }); }
+  })();
+}
+
+function extraItemSheet() {
+  sheet({
+    title: 'Add extra / additional item from Master CSR',
+    body: `
+      <div class="notice info">${ICON.sparkle}<div>Type what was actually installed (e.g. <b>exhaust fan</b>, <b>chemical earthing</b>, <b>LED street light</b>). The app attaches the correct item code, legal description, unit and rate from the Master CSR — no manual rate entry.</div></div>
+      <div style="margin:12px 0"><input class="i" id="xi-q" placeholder="Search the Master CSR…" autofocus></div>
+      <div id="xi-res"><div class="muted small">Start typing to search ${esc((S.csr.fy || '2024-25'))} · ${esc(S.csr.region || 'Pune')} region.</div></div>
+      <div class="hr"></div>
+      <details><summary class="small muted">Item not in the Schedule of Rates? Enter a non-schedule item</summary>
+        <div class="grid g2" style="margin-top:10px">
+          <div style="grid-column:1/-1"><label class="f">Non-schedule description</label><input class="i" id="ns-desc" placeholder="Providing and fixing ... as approved by competent authority"></div>
+          <div><label class="f">Unit</label><input class="i" id="ns-unit" value="Each"></div>
+          <div><label class="f">Rate (₹)</label><input class="i" id="ns-rate" type="number" step="0.01"></div>
+          <div style="grid-column:1/-1"><label class="f">Reason / approval reference</label><input class="i" id="ns-reason" placeholder="Not covered in CSR — approved vide letter No ..."></div>
+          <div><label class="f">Quantity</label><input class="i" id="ns-qty" type="number" step="0.001" value="1"></div>
+          <div style="display:flex;align-items:flex-end"><button class="btn pri block" data-act="add-ns">Add non-schedule item</button></div>
+        </div>
+      </details>`,
+  });
+  const run = debounce(async () => {
+    const q = document.getElementById('xi-q').value.trim();
+    const box = document.getElementById('xi-res');
+    if (q.length < 2) { box.innerHTML = '<div class="muted small">Type at least 2 characters.</div>'; return; }
+    box.innerHTML = loading('Searching Master CSR…');
+    try {
+      const r = await api(`/api/csr/suggest?q=${encodeURIComponent(q)}&fy=${S.csr.fy}&region=${S.csr.region}`);
+      box.innerHTML = (r.results || []).length ? r.results.map((it) => `
+        <div class="item-card" style="margin-bottom:8px">
+          <div class="row between"><span class="pill-code">${esc(it.item_code)}</span>
+            <span class="badge brand">₹ ${inr(it.rate)} / ${esc(it.unit)}</span></div>
+          <div class="small">${esc(it.description)}</div>
+          <div class="row">${(it.tags || []).map((t) => `<span class="badge tiny">${esc(t)}</span>`).join('')}
+            <div style="flex:1"></div>
+            <input class="i" style="max-width:110px" type="number" step="0.001" placeholder="qty" id="xq-${it.id}">
+            <button class="btn pri sm" data-act="add-extra" data-id="${it.id}">${ICON.plus} Add to project</button></div>
+        </div>`).join('') : '<div class="muted small">No CSR item matched. Use the non-schedule entry below.</div>';
+    } catch (e) { box.innerHTML = `<div class="notice bad">${esc(e.message)}</div>`; }
+  }, 350);
+  document.getElementById('xi-q').addEventListener('input', run);
+}
+
+/* ------------------------------------------------------------------- admin */
+async function viewAdmin(view) {
+  setTitle('Admin Control', 'Master CSR database, users, audit trail and parsing jobs');
+  const [o, jobs] = await Promise.all([api('/api/admin/overview'), api('/api/admin/parse-jobs').catch(() => ({ jobs: [] }))]);
+  const st = o.stats;
+  view.innerHTML = `
+    <div class="grid g4" style="margin-bottom:14px">
+      <div class="card kpi"><div class="lbl">Master CSR rows</div><div class="val">${inr(st.master_rows, 0)}</div>
+        <div class="foot">${st.versions} FY × region versions</div></div>
+      <div class="card kpi"><div class="lbl">Engineers</div><div class="val">${st.engineer_count}</div>
+        <div class="foot">${st.user_count} users total</div></div>
+      <div class="card kpi"><div class="lbl">Projects</div><div class="val">${st.project_count}</div>
+        <div class="foot">${st.measurement_count} measurement entries</div></div>
+      <div class="card kpi"><div class="lbl">Verified value</div><div class="val sm">₹ ${inr(st.measurement_value, 0)}</div>
+        <div class="foot">${st.photo_count} site photos</div></div>
+    </div>
+    <div class="tabs" style="margin-bottom:14px">
+      ${[['master', 'Master CSR versions'], ['users', 'Users & roles'], ['audit', 'Audit trail'], ['jobs', 'Parsing jobs']]
+      .map(([k, l]) => `<button data-act="atab" data-t="${k}" class="${S.adminTab === k ? 'on' : ''}">${l}</button>`).join('')}
+    </div>
+    <div id="adminbody"></div>`;
+  const b = document.getElementById('adminbody');
+  if (S.adminTab === 'master') {
+    b.innerHTML = `
+      <div class="card">
+        <div class="hd">${ICON.book}<h3>CSR versions in the Master Database</h3><div style="flex:1"></div>
+          <button class="btn sm" data-act="reseed-master">Rebuild demo master data</button></div>
+        <div class="bd tight scrollx">
+          <table class="tbl"><thead><tr><th>FY</th><th>Region</th><th class="num">Items</th><th>Status</th><th>Source file</th><th>Uploaded</th><th></th></tr></thead>
+          <tbody>${st.items_per_version.map((v) => `<tr>
+            <td><b>${esc(v.fy)}</b></td><td>${esc(v.region)}</td><td class="num">${v.item_count}</td>
+            <td>${badgeFor(v.status)}</td><td class="small muted">${esc(v.source_file || '—')}</td>
+            <td class="small">${dtt(v.uploaded_at)}</td>
+            <td class="nowrap"><button class="btn sm" data-act="dl" data-path="/api/csr/export?fy=${encodeURIComponent(v.fy)}&region=${encodeURIComponent(v.region)}" data-name="MasterCSR_${esc(v.fy)}_${esc(v.region)}.xlsx">Export</button>
+              <button class="btn sm danger" data-act="del-version" data-fy="${esc(v.fy)}" data-region="${esc(v.region)}">Delete</button></td></tr>`).join('')}</tbody></table>
+        </div>
+        <div class="bd small muted">Upload a new financial year from the <a href="#/csr">Master CSR</a> screen (Super Admin panel at the top). Imports are two-step: preview &amp; validate, then commit. Existing item codes are updated, new codes are inserted, malformed rows are reported with the row number.</div>
+      </div>`;
+  } else if (S.adminTab === 'users') {
+    b.innerHTML = `
+      <div class="card" style="margin-bottom:12px">
+        <div class="hd">${ICON.shield}<h3>Create user</h3></div>
+        <div class="bd">
+          <div class="grid g4">
+            <div><label class="f">Name</label><input class="i" id="u-name" placeholder="Er. ..."></div>
+            <div><label class="f">Email</label><input class="i" id="u-email" placeholder="je.*@pwd.maharashtra.gov.in"></div>
+            <div><label class="f">Role</label><select class="i" id="u-role"><option value="engineer">Site Engineer</option><option value="admin">Super Admin</option></select></div>
+            <div><label class="f">Designation</label><input class="i" id="u-desig" value="Junior Engineer (Electrical)"></div>
+            <div><label class="f">Division</label><input class="i" id="u-div" placeholder="PWD Electrical Sub-Division, ..."></div>
+            <div><label class="f">Circle</label><input class="i" id="u-circle" placeholder="... Circle"></div>
+            <div><label class="f">Region</label><select class="i" id="u-region">${['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option>${r}</option>`).join('')}</select></div>
+            <div><label class="f">Temp. password</label><input class="i" id="u-pass" value="Welcome@123"></div>
+          </div>
+          <div class="row" style="margin-top:12px"><button class="btn pri" data-act="create-user">${ICON.plus} Create account</button></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>Users (${o.users.length})</h3></div>
+        <div class="bd tight scrollx">
+          <table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Division / circle</th><th>Region</th><th>Last login</th><th>Status</th><th></th></tr></thead>
+          <tbody>${o.users.map((u) => `<tr>
+            <td><b>${esc(u.name)}</b><div class="tiny muted">${esc(u.designation || '')}</div></td>
+            <td class="small">${esc(u.email)}</td>
+            <td>${u.role === 'admin' ? '<span class="badge brand">Super Admin</span>' : '<span class="badge">Site Engineer</span>'}</td>
+            <td class="small">${esc(u.division || '—')}<div class="tiny muted">${esc(u.circle || '')}</div></td>
+            <td class="small">${esc(u.region || '—')}</td>
+            <td class="small">${u.last_login ? dtt(u.last_login) : '—'}</td>
+            <td>${u.is_active ? '<span class="badge ok">Active</span>' : '<span class="badge bad">Disabled</span>'}</td>
+            <td class="nowrap"><button class="btn sm" data-act="toggle-user" data-id="${u.id}" data-v="${u.is_active ? 0 : 1}">${u.is_active ? 'Disable' : 'Enable'}</button>
+              <button class="btn sm" data-act="reset-pass" data-id="${u.id}">Reset password</button>
+              <button class="btn sm danger" data-act="del-user" data-id="${u.id}" data-name="${esc(u.name)}">Delete</button></td>
+          </tr>`).join('')}</tbody></table>
+        </div>
+      </div>`;
+  } else if (S.adminTab === 'audit') {
+    b.innerHTML = `
+      <div class="card">
+        <div class="hd">${ICON.doc}<h3>Audit trail — every master change, import and measurement</h3></div>
+        <div class="bd tight scrollx">
+          <table class="tbl"><thead><tr><th>When</th><th>User</th><th>Action</th><th>Entity</th><th>Detail</th></tr></thead>
+          <tbody>${o.audit.map((a) => `<tr>
+            <td class="small nowrap">${dtt(a.created_at)}</td>
+            <td class="small">${esc(a.user_name)}</td>
+            <td><span class="badge info">${esc(a.action)}</span></td>
+            <td class="small mono">${esc(a.entity)} ${a.entity_id ? '#' + esc(a.entity_id) : ''}</td>
+            <td class="tiny muted">${esc((a.detail || '').slice(0, 130))}</td></tr>`).join('')}</tbody></table>
+        </div>
+      </div>`;
+  } else {
+    b.innerHTML = `
+      <div class="card">
+        <div class="hd">${ICON.doc}<h3>Parsing jobs</h3></div>
+        <div class="bd tight scrollx">
+          <table class="tbl"><thead><tr><th>When</th><th>Project</th><th>File</th><th>Engine</th><th class="num">Anchors</th><th class="num">Matched</th><th class="num">Unknown</th></tr></thead>
+          <tbody>${(jobs.jobs || []).map((j) => `<tr><td class="small">${dtt(j.created_at)}</td>
+            <td class="small">${esc(j.project_code || '—')}</td><td class="small">${esc(j.filename)}</td>
+            <td class="small">${esc(j.engine)}</td><td class="num">${j.anchors || 0}</td>
+            <td class="num">${j.matched || 0}</td><td class="num">${j.unknown || 0}</td></tr>`).join('')
+      || '<tr><td colspan="7" class="empty">No parsing jobs yet.</td></tr>'}</tbody></table>
+        </div>
+      </div>`;
+  }
+}
+
+/* --------------------------------------------------------- global handlers */
+document.addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-act]');
+  if (!t) return;
+  const act = t.dataset.act;
+  const stop = () => { e.preventDefault(); e.stopPropagation(); };
+
+  if (act === 'close-sheet') { closeSheet(); return; }
+  if (act === 'logout') { logout(); return; }
+  if (act === 'demo') { enterDemo(); return; }
+  if (act === 'fill') {
+    document.getElementById('l-email').value = t.dataset.email;
+    document.getElementById('l-pass').value = t.dataset.pass;
+    return;
+  }
+  if (act === 'login') {
+    const email = document.getElementById('l-email').value.trim();
+    const password = document.getElementById('l-pass').value;
+    const btn = document.getElementById('l-btn');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Signing in…';
+    try {
+      const r = await api('/api/auth/login', { method: 'POST', body: { email, password } });
+      S.token = r.token; S.user = r.user; S.demo = false;
+      localStorage.setItem('smartmb_token', r.token);
+      localStorage.setItem('smartmb_user', JSON.stringify(r.user));
+      S.csr.region = r.user.region || 'Pune';
+      toast(`Welcome, ${r.user.name}`, 'ok');
+      location.hash = '#/dashboard'; render();
+    } catch (err) {
+      document.getElementById('login-err').innerHTML = `<div class="notice bad">${ICON.warn}<div>${esc(err.message)}</div></div>`;
+      btn.disabled = false; btn.textContent = 'Sign in';
+      if (err.offline && DEMO) {
+        document.getElementById('login-err').insertAdjacentHTML('beforeend',
+          `<button class="btn block" data-act="demo" style="margin-top:8px">${ICON.sparkle} Explore offline demo instead</button>`);
+      }
+    }
+    return;
+  }
+  if (act === 'help') {
+    sheet({
+      title: 'How Smart-MB works', body: `
+      <div class="small stack">
+        <div><b>1 · Master CSR (admin)</b><div class="muted">The full Electrical Schedule of Rates lives in the Master Database with item codes, legal descriptions, units and rates, tagged with metadata (Fan, Earthing, LED…).</div></div>
+        <div><b>2 · Project estimate (engineer)</b><div class="muted">Upload the Technical Sanction estimate. Anchor-based parsing finds the item codes and quantities.</div></div>
+        <div><b>3 · Smart Map</b><div class="muted">Codes are resolved against the Master CSR — the description/unit/rate always come from the database, so OCR noise never reaches the MB.</div></div>
+        <div><b>4 · Joint measurement</b><div class="muted">Room-wise checklist, dimension entry (No · L · B · H), photo evidence, extra items pulled straight from the CSR.</div></div>
+        <div><b>5 · Form-23 MB</b><div class="muted">Official MB PDF/Excel with deviation statement (excess/savings valued at CSR rates) and signature blocks.</div></div>
+        <div class="hr"></div>
+        <div class="muted tiny">Smart-MB · Maharashtra PWD Electrical · demo build</div>
+      </div>`});
+    return;
+  }
+  if (act === 'open-project') { location.hash = '#/project/' + t.dataset.id; return; }
+  if (act === 'ptab') { S.proj.tab = t.dataset.t; render(); return; }
+  if (act === 'atab') { S.adminTab = t.dataset.t; render(); return; }
+  if (act === 'room') { S.proj.room = t.dataset.id ? Number(t.dataset.id) : null; render(); return; }
+  if (act === 'add-room') {
+    sheet({
+      title: 'Add measurement location', body: `
+        <label class="f">Floor / level</label><input class="i" id="r-floor" placeholder="Ground Floor">
+        <div style="height:10px"></div>
+        <label class="f">Room / location name</label><input class="i" id="r-name" placeholder="Class Room 1">`,
+      footer: `<button class="btn" data-act="close-sheet">Cancel</button><button class="btn pri" id="r-save">Add room</button>`,
+    });
+    document.getElementById('r-save').addEventListener('click', async () => {
+      const name = document.getElementById('r-name').value.trim();
+      if (!name) { toast('Enter the room name', 'bad'); return; }
+      try {
+        await api(`/api/projects/${S.proj.id}/rooms`, { method: 'POST', body: { name, floor: document.getElementById('r-floor').value } });
+        closeSheet(); toast('Room added', 'ok'); render();
+      } catch (err) { toast(err.message, 'bad'); }
+    });
+    return;
+  }
+  if (act === 'measure') { measureSheet(Number(t.dataset.id)); return; }
+  if (act === 'extra-item') { extraItemSheet(); return; }
+  if (act === 'add-extra') {
+    const id = Number(t.dataset.id);
+    const qtyEl = document.getElementById('xq-' + id);
+    const qty = Number((qtyEl && qtyEl.value) || 0);
+    if (!qty) { toast('Enter the quantity actually executed', 'bad'); return; }
+    try {
+      const r = await api(`/api/projects/${S.proj.id}/items`, { method: 'POST', body: { master_item_id: id, tendered_qty: qty, source: 'extra' } });
+      closeSheet();
+      toast(`Added ${r.item_code} — ${r.description.slice(0, 44)}… @ ₹ ${inr(r.rate)}/${r.unit}`, 'ok', 5000);
+      S.proj.tab = 'checklist'; render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'add-ns') {
+    const g = (x) => (document.getElementById(x) || {}).value || '';
+    if (!g('ns-desc').trim()) { toast('Enter the non-schedule description', 'bad'); return; }
+    try {
+      const r = await api(`/api/projects/${S.proj.id}/items`, {
+        method: 'POST', body: {
+          description: g('ns-desc'), unit: g('ns-unit'), rate: Number(g('ns-rate') || 0),
+          tendered_qty: Number(g('ns-qty') || 0), is_non_schedule: true, ns_reason: g('ns-reason'), source: 'manual',
+        }
+      });
+      closeSheet(); toast(`Non-schedule item ${r.item_code} added`, 'ok'); S.proj.tab = 'checklist'; render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'del-project') {
+    const p = S.proj.data && S.proj.data.project;
+    if (!confirm(`Delete project "${(p && p.name) || ''}" and all its measurements? This cannot be undone.`)) return;
+    try {
+      await api(`/api/projects/${t.dataset.id}`, { method: 'DELETE' });
+      toast('Project deleted', 'ok');
+      S.proj.id = null; S.proj.tab = 'overview';
+      location.hash = '#/projects'; render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'del-meas') {
+    if (!confirm('Delete this measurement entry?')) return;
+    try { await api(`/api/measurements/${t.dataset.id}`, { method: 'DELETE' }); toast('Deleted', 'ok'); render(); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'edit-meas') {
+    const { measurements } = await api(`/api/projects/${S.proj.id}/measurements`);
+    const row = measurements.find((m) => m.id === Number(t.dataset.id));
+    if (row) measureSheet(row.project_item_id, row);
+    return;
+  }
+  if (act === 'photo') {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = 'image/*'; input.capture = 'environment';
+    input.onchange = async () => {
+      if (!input.files[0]) return;
+      const fd = new FormData(); fd.append('file', input.files[0]); fd.append('caption', 'Site evidence');
+      try { await api(`/api/measurements/${t.dataset.id}/photos`, { method: 'POST', form: fd }); toast('Photo attached to the measurement record', 'ok'); render(); }
+      catch (err) { toast(err.message, 'bad'); }
+    };
+    input.click();
+    return;
+  }
+  if (act === 'gallery') {
+    const mid = t.dataset.id;
+    const { photos } = await api(`/api/measurements/${mid}/photos`);
+    const auth = S.token ? '?token=' + encodeURIComponent(S.token) : '';
+    sheet({
+      title: `${photos.length} site photo(s) — measurement evidence`,
+      wide: true,
+      body: photos.length ? `<div class="grid g-auto">${photos.map((p) => `
+        <figure style="margin:0">
+          <img src="${esc(p.url)}${auth}" alt="${esc(p.caption || 'site photo')}" style="width:100%;border-radius:12px;border:1px solid var(--line)">
+          <figcaption class="tiny muted" style="margin-top:6px">${esc(p.caption || '')} · ${dtt(p.uploaded_at)}</figcaption>
+        </figure>`).join('')}</div>` : '<div class="muted small">No photos attached.</div>',
+    });
+    return;
+  }
+  if (act === 'gen') {
+    const fmt = t.dataset.fmt;
+    const mb = (S.proj.data && S.proj.data.project && S.proj.data.project.mb_no) || S.proj.id;
+    await download(`/api/projects/${S.proj.id}/form23.${fmt}`, `Form23_MB_${mb}.${fmt}`);
+    return;
+  }
+  if (act === 'dl') {
+    await download(t.dataset.path, t.dataset.name || 'download');
+    return;
+  }
+  if (act === 'new-project') { newProjectSheet(); return; }
+  if (act === 'csr-cat') { S.csr.category = t.dataset.v; S.csr.page = 0; render(); return; }
+  if (act === 'csr-page') { S.csr.page = Math.max(0, Number(t.dataset.p)); render(); return; }
+  if (act === 'csr-item') { csrItemSheet(t.dataset.id); return; }
+  if (act === 'save-tags') {
+    try {
+      const tags = document.getElementById('tag-input').value.split(',').map((s) => s.trim()).filter(Boolean);
+      await api(`/api/csr/items/${t.dataset.id}/tags`, { method: 'POST', body: tags });
+      toast('Metadata tags saved — they drive the Extra-Item search', 'ok'); closeSheet();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'csr-export') {
+    await download(`/api/csr/export?fy=${encodeURIComponent(S.csr.fy)}&region=${encodeURIComponent(S.csr.region)}`,
+      `MasterCSR_${S.csr.fy}_${S.csr.region}.xlsx`);
+    return;
+  }
+  if (act === 'csr-template') { await download('/api/samples/MasterCSR_import_template.xlsx', 'MasterCSR_import_template.xlsx'); return; }
+  if (act === 'csr-preview' || act === 'csr-commit') {
+    const file = document.getElementById('imp-file');
+    if (!file.files[0]) { toast('Choose the CSR Excel/CSV file first', 'bad'); return; }
+    const fd = new FormData();
+    fd.append('file', file.files[0]);
+    fd.append('fy', document.getElementById('imp-fy').value);
+    fd.append('region', document.getElementById('imp-region').value);
+    fd.append('mode', document.getElementById('imp-mode').value);
+    fd.append('commit', act === 'csr-commit' ? 'true' : 'false');
+    const box = document.getElementById('imp-result');
+    box.innerHTML = loading(act === 'csr-commit' ? 'Importing into the Master Database…' : 'Validating file…');
+    try {
+      const r = await api('/api/csr/import', { method: 'POST', form: fd });
+      if (!r.ok) {
+        box.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>${esc(r.error)}</b><br>Detected columns: ${esc(JSON.stringify(r.columns_detected || r.columns || {}))}</div></div>`;
+        return;
+      }
+      box.innerHTML = `
+        <div class="notice ${r.committed ? 'ok' : 'info'}">${ICON.check}<div>
+          ${r.committed ? '<b>Committed to the Master Database.</b><br>' : '<b>Validation preview (nothing written yet).</b><br>'}
+          ${r.item_count} valid rows parsed · <b>${r.new}</b> new codes · <b>${r.updates}</b> existing codes updated
+          ${r.error_count ? ` · <b>${r.error_count}</b> row(s) rejected` : ''}
+          <div class="tiny">Columns detected: ${esc(Object.entries(r.columns_detected || {}).map(([k, v]) => `${k}=col${v + 1}`).join(' · '))}</div>
+        </div></div>
+        ${r.errors && r.errors.length ? `<div class="notice warn" style="margin-top:8px">${ICON.warn}<div>${r.errors.slice(0, 6).map((x) => `row ${x.row}: ${esc(x.reason)}`).join('<br>')}</div></div>` : ''}
+        <div class="scrollx" style="max-height:320px;overflow:auto;margin-top:10px">
+          <table class="tbl"><thead><tr><th>Item code</th><th>Description</th><th>Unit</th><th class="num">Rate</th><th>Category</th></tr></thead>
+          <tbody>${r.items.slice(0, 60).map((i) => `<tr><td><span class="pill-code">${esc(i.item_code)}</span></td>
+            <td class="small">${esc((i.description || '').slice(0, 90))}</td><td>${esc(i.unit)}</td>
+            <td class="num">${inr(i.rate)}</td><td class="small muted">${esc(i.category || '')}</td></tr>`).join('')}</tbody></table>
+        </div>`;
+      document.getElementById('imp-commit').disabled = r.committed;
+      if (r.committed) toast(`Master CSR updated — ${r.live_count} live items for ${r.fy} ${r.region}`, 'ok');
+    } catch (err) { box.innerHTML = `<div class="notice bad">${ICON.warn}<div>${esc(err.message)}</div></div>`; }
+    return;
+  }
+  if (act === 'reseed-master') {
+    if (!confirm('Rebuild the demo master data (2 FY × 7 regions)? This resets the CSR tables.')) return;
+    try { const r = await api('/api/admin/reseed?master=true', { method: 'POST' }); toast(`Master rebuilt: ${r.master.rows} rows`, 'ok'); render(); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'create-user') {
+    const g = (x) => (document.getElementById(x) || {}).value || '';
+    try {
+      const r = await api('/api/admin/users', {
+        method: 'POST', body: {
+          name: g('u-name'), email: g('u-email'), role: g('u-role'), designation: g('u-desig'),
+          division: g('u-div'), circle: g('u-circle'), region: g('u-region'), password: g('u-pass'),
+        }
+      });
+      toast(`Account created. Temporary password: ${r.default_password}`, 'ok', 6000); render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'toggle-user') {
+    try { await api(`/api/admin/users/${t.dataset.id}`, { method: 'PATCH', body: { is_active: Number(t.dataset.v) } }); toast('User updated', 'ok'); render(); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'del-version') {
+    const { fy, region } = t.dataset;
+    if (!confirm(`Delete the entire Master CSR version ${fy} · ${region}?\nProjects that reference it will keep their imported rows but can no longer resolve new items from it.`)) return;
+    try {
+      await api(`/api/csr/versions?fy=${encodeURIComponent(fy)}&region=${encodeURIComponent(region)}`, { method: 'DELETE' });
+      toast(`CSR version ${fy} · ${region} deleted`, 'ok'); render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'del-user') {
+    if (!confirm(`Delete the account of ${t.dataset.name}?`)) return;
+    try { await api(`/api/admin/users/${t.dataset.id}`, { method: 'DELETE' }); toast('User deleted', 'ok'); render(); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'reset-pass') {
+    const pwd = prompt('New temporary password for this user:', 'Welcome@123');
+    if (!pwd) return;
+    try { await api(`/api/admin/users/${t.dataset.id}`, { method: 'PATCH', body: { password: pwd } }); toast('Password reset', 'ok'); }
+    catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
+  if (act === 'show-prompt') {
+    const sample = S.importPreview && S.importPreview.ai_prompt ? S.importPreview.ai_prompt
+      : `You are an Estimate Mapper.\n\nInput 1: A raw text stream from a scanned PWD Estimate PDF.\nInput 2: A list of valid Item Codes from our Master Database (e.g. ['1-1-1','1-1-2', ...]).\n\nTask:\n1. Identify every valid Item Code in the PDF text.\n2. Extract the 'Quantity' associated with that code.\n3. Return JSON: [{"code":"1-1-2","pdf_qty":50}]\n4. If a code is found in the PDF but NOT in the Master List, flag it as 'Unknown_Item'.`;
+    sheet({ title: 'Parsing engine prompt', wide: true, body: `<pre class="mono tiny" style="white-space:pre-wrap;background:#0f172a;color:#cbd5e1;padding:14px;border-radius:12px">${esc(sample)}</pre>
+      <div class="notice info" style="margin-top:10px">${ICON.sparkle}<div>The production engine is deterministic (regex + column heuristics). This prompt is kept for the optional LLM fallback mode — plug in an API key on the server to enable it for pathological scans.</div></div>` });
+    return;
+  }
+  if (act === 'sample-file') { return; }
+  if (stop) stop();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeSheet();
+});
+
+window.addEventListener('hashchange', () => { if (S.token || S.demo) render(); else renderLogin(); });
+
+(async function boot() {
+  if (!S.token && !S.demo) { renderLogin(); return; }
+  if (S.token) {
+    try {
+      const r = await api('/api/auth/me');
+      S.user = r.user;
+      S.csr.region = r.user.region || 'Pune';
+    } catch (e) {
+      if (e.offline && DEMO) { S.token = ''; renderLogin(); return; }
+      S.token = ''; localStorage.removeItem('smartmb_token');
+      renderLogin(); return;
+    }
+  }
+  if (!location.hash) location.hash = '#/dashboard';
+  render();
+})();
