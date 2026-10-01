@@ -1561,10 +1561,12 @@ function svChip(cell) {
 
 async function tabVerify(body, p, wl) {
   const pr = p.project;
-  wl = await api(`/api/projects/${pr.id}/verify`).catch(() => wl);
+  if (!S.verify.docId && wl && wl.docs && wl.docs.length) S.verify.docId = wl.docs[0].id;
+  const q = S.verify.docId ? `?doc_id=${S.verify.docId}` : '';
+  wl = await api(`/api/projects/${pr.id}/verify${q}`).catch(() => wl);
   if (!wl || !wl.docs || !wl.docs.length) return svImportPanel(body, pr);
   const t = wl.totals || { cells: 0, pending: 0, kept: 0, changed: 0, progress_pct: 0 };
-  const rec = await api(`/api/projects/${pr.id}/reconciliation`).catch(() => null);
+  const rec = await api(`/api/projects/${pr.id}/reconciliation${q}`).catch(() => null);
   const sec = S.verify.section;
   body.innerHTML = `
     <div class="card" style="margin-bottom:14px">
@@ -1578,7 +1580,7 @@ async function tabVerify(body, p, wl) {
           </div>
           <div class="row">
             <button class="btn sm" data-act="sv-import-again">${ICON.up} Another schedule</button>
-            ${wl.docs.length > 1 ? `<select class="i" id="sv-doc" style="max-width:220px">${wl.docs.map((d) => `<option value="${d.id}">${esc(d.filename)} · ${d.checked}/${d.cells}</option>`).join('')}</select>` : ''}
+            ${wl.docs.length > 1 ? `<select class="i" id="sv-doc" style="max-width:220px">${wl.docs.map((d) => `<option value="${d.id}" ${d.id === S.verify.docId ? 'selected' : ''}>${esc(d.filename)} · ${d.checked}/${d.cells}</option>`).join('')}</select>` : ''}
           </div>
         </div>
         <div class="grid g4" style="margin-top:14px">
@@ -1603,7 +1605,10 @@ async function tabVerify(body, p, wl) {
   }));
   body.querySelector('[data-act="sv-import-again"]')?.addEventListener('click', () => svImportPanel(body, pr));
   const sel = body.querySelector('#sv-doc');
-  if (sel) sel.addEventListener('change', () => { S.verify.docId = Number(sel.value); tabVerify(body, p, wl); });
+  if (sel) {
+    sel.value = S.verify.docId;
+    sel.addEventListener('change', () => { S.verify.docId = Number(sel.value); tabVerify(body, p, wl); });
+  }
   if (sec === 'rooms') svRenderRooms(sb, pr, wl);
   else if (sec === 'recon') svRenderRecon(sb, rec, wl, pr);
   else svRenderDocs(sb, pr, wl);
@@ -1801,7 +1806,7 @@ function svRenderRooms(box, pr, wl) {
     const room = wl.rooms.find((r) => String(r.location_id) === b.dataset.keepall);
     b.disabled = true; b.innerHTML = '<span class="spin"></span>…';
     try {
-      const r = await api(`/api/schedule-docs/${wl.docs[0].id}/verify-bulk`, {
+      const r = await api(`/api/schedule-docs/${(S.verify.docId || wl.docs[0].id)}/verify-bulk`, {
         method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
       toast(`${esc(room.name)}: ${r.verified} quantit${r.verified === 1 ? 'y' : 'ies'} confirmed as per schedule` + (r.failed.length ? ` · ${r.failed.length} need item linking` : ''), r.failed.length ? 'warn' : 'ok');
       render();
@@ -1811,9 +1816,10 @@ function svRenderRooms(box, pr, wl) {
 
 /* ------------------------------------------------------- room verify sheet */
 async function svRoomSheet(pr, room, wl) {
-  wl = await api(`/api/projects/${pr.id}/verify`).catch(() => wl);
+  const q = S.verify.docId ? `?doc_id=${S.verify.docId}` : '';
+  wl = await api(`/api/projects/${pr.id}/verify${q}`).catch(() => wl);
   room = wl.rooms.find((r) => r.location_id === room.location_id) || room;
-  const docId = wl.docs[0].id;
+  const docId = S.verify.docId || wl.docs[0].id;
   const unlinked = room.items.filter((i) => !i.project_item_id);
   const bodyHtml = `
     <div class="row between" style="margin-bottom:10px">
@@ -1898,7 +1904,7 @@ async function svRoomSheet(pr, room, wl) {
 
 /* ------------------------------------------------------------- link a column */
 async function svLinkSheet(pr, wl, cell) {
-  const docId = wl.docs[0].id;
+  const docId = S.verify.docId || wl.docs[0].id;
   const doc = await api(`/api/schedule-docs/${docId}`);
   let parsedCols = [];
   try { parsedCols = (JSON.parse(doc.raw_json || '{}').columns) || []; } catch (e) { parsedCols = []; }
