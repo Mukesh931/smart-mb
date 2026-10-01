@@ -32,6 +32,23 @@ Replace `<your-user>/<your-repo>`. `.gitignore` already excludes `data/` (the ru
 file, uploaded estimates, site photos), `__pycache__/`, virtualenvs and editor files — so no
 live rate data or site evidence ends up in the repo.
 
+### Option 0 — scripted GitHub push (the fast path)
+
+`tools/deploy_all.py` does the push for you when you would rather not touch git remotes:
+
+```bash
+export GITHUB_TOKEN=ghp_...        # PAT with 'repo' scope (classic) or Contents: Read+Write (fine-grained)
+python3 -m tools.deploy_all github --repo-name smart-mb --visibility public
+```
+
+It creates the repository, pushes `main`, sets topics — and never stores the token.
+Combined run (push + Render service + health check):
+
+```bash
+export GITHUB_TOKEN=... RENDER_API_KEY=rnd_...
+python3 -m tools.deploy_all all --plan free --region singapore
+```
+
 ---
 
 ## 2 · Deploy on Render
@@ -46,7 +63,28 @@ live rate data or site evidence ends up in the repo.
    users and one fully measured demo project.
 5. Open the service URL — you should land on the Smart-MB login screen.
 
-### Option B — Manual web service (if you prefer the dashboard)
+### Option B — via the Render API (scripted, or when you cannot use the dashboard)
+
+```bash
+export RENDER_API_KEY=rnd_...      # Render → Account Settings → API Keys
+python3 -m tools.deploy_all render --service-name smart-mb --plan free --region singapore
+
+# with a persistent disk (paid plan) so measurements survive deploys:
+python3 -m tools.deploy_all render --plan starter --disk
+```
+
+Preview the exact API payload without touching the network:
+
+```bash
+python3 -m tools.deploy_all render --dry-run
+```
+
+> Note: Render’s API can create the service and start the deploy, but the **one-time GitHub ↔ Render
+> account authorisation** must be granted once in the dashboard (Render has no API for that).
+> If the API returns 400/402 on first use, open <https://dashboard.render.com> → **New + → Blueprint**
+> once, which performs that authorisation, and use the script for every deploy after that.
+
+### Option C — Manual web service (dashboard, no scripting)
 
 | Setting | Value |
 |---|---|
@@ -99,6 +137,17 @@ Then in the browser:
    Use *Download template* to get the expected columns.
 3. Create a project, upload a Technical Sanction estimate, and walk the checklist →
    measurement → Form-23 flow once end-to-end before circulating the URL.
+
+---
+
+## 4b · Scripted redeploys
+
+After the first deploy, shipping a change is one command (or just `git push`, since `autoDeploy` is on):
+
+```bash
+python3 -m tools.deploy_all github          # commit + push
+python3 -m tools.deploy_all render          # trigger a deploy and wait for "live"
+```
 
 ---
 

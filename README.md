@@ -249,7 +249,8 @@ smart-mb/
 │   ├── embed_demo.py          injects a read-only data snapshot into index.html
 │   ├── smoke_test.py          48-check end-to-end API test of every flow
 │   ├── ui_test.mjs            16-check headless render test of every screen
-│   └── build_standalone.py    single-file HTML build
+│   ├── build_standalone.py    single-file HTML build
+│   └── deploy_all.py          scripted GitHub push + Render service creation (env-provided tokens)
 └── data/                      smartmb.sqlite3 · uploads/ · photos/   (created at runtime)
 ```
 
@@ -280,7 +281,15 @@ git init -b main && git add . && git commit -m "Smart-MB platform"
 git remote add origin https://github.com/<you>/<repo>.git && git push -u origin main
 ```
 
-Then in Render: **New + → Blueprint → pick the repo → Apply**. Full walkthrough, environment
+Prefer not to touch git remotes? The same thing scripted (tokens read from the environment, never stored):
+
+```bash
+export GITHUB_TOKEN=ghp_...  RENDER_API_KEY=rnd_...
+python3 -m tools.deploy_all all --repo-name smart-mb --visibility public --plan free
+# → creates the repo, pushes main, creates the Render service, waits for "live", runs /api/health
+```
+
+Or in the dashboard: **New + → Blueprint → pick the repo → Apply**. Full walkthrough, environment
 variables, free-tier caveats and a post-deploy checklist: **[`docs/DEPLOY.md`](docs/DEPLOY.md)**.
 
 Quick check once it is live:
