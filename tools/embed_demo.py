@@ -5,7 +5,7 @@ Run after seeding:  python3 -m tools.embed_demo
 """
 from __future__ import annotations
 import json, os, re
-from app import db, main, seed
+from app import db, main, schedule_store, seed
 from app.db import rows_to_dicts
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +26,25 @@ def build_snapshot() -> dict:
     dev = main.deviations(project_id, admin)
     items = main.project_items(project_id, admin)["items"]
     meas = main.list_measurements(project_id, None, admin)["measurements"][:40]
+    verify = schedule_store.verify_worklist(project_id)
+    verify["docs"] = [{k: v for k, v in d.items() if k != "raw_json"}
+                      for d in schedule_store.list_documents(project_id)]
+    recon = schedule_store.reconciliation(project_id)
+    recon["rows"] = [{k: v for k, v in r.items() if k != "cells"} for r in recon["rows"]][:60]
+    schedule_doc = None
+    _docs = schedule_store.list_documents(project_id)
+    if _docs:
+        schedule_doc = schedule_store.get_document(_docs[0]["id"])
+        schedule_doc["cells"] = schedule_doc["cells"][:120]
+        # the linking sheet only needs the column headings + their candidate shortlists
+        try:
+            _raw = json.loads(schedule_doc.pop("raw_json") or "{}")
+            schedule_doc["raw_json"] = json.dumps({"columns": [
+                {"order": c.get("order"), "label": c.get("label"), "cells": {},
+                 "match_confidence": c.get("match_confidence"), "match_ambiguous": c.get("match_ambiguous"),
+                 "alternatives": (c.get("alternatives") or [])[:3]} for c in _raw.get("columns", [])]})
+        except Exception:
+            schedule_doc["raw_json"] = "{}"
     versions = rows_to_dicts(db.q("SELECT * FROM csr_versions ORDER BY fy DESC, region"))
     for v in versions:
         v["live_count"] = v["item_count"]
@@ -52,6 +71,9 @@ def build_snapshot() -> dict:
         "checklist": cl,
         "deviations": dev,
         "measurements": meas,
+        "verify": verify,
+        "reconciliation": recon,
+        "schedule_doc": schedule_doc,
         "dashboard": dash,
         "admin": overview,
     }

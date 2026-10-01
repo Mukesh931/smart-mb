@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -179,6 +180,90 @@ row = [x for x in dev["rows"] if x["measured"] > 0][0]
 check("deviation math per item", abs(row["dev_amount"] - row["dev_qty"] * row["rate"]) < 0.01,
       f"{row['item_code']}: {row['measured']} vs {row['tendered']}")
 
+print("\n[8b] Descriptive schedule - extract, reconcile, verify room-wise")
+st, sch_prev = upload(f"/api/projects/{PID}/parse-schedule",
+                      os.path.join(ROOT, "samples", "descriptive_schedule_sample.pdf"), token=ETOK)
+check("descriptive schedule parsed", st == 200 and sch_prev.get("ok"), sch_prev.get("engine", ""))
+sst = sch_prev.get("stats", {})
+check("rotated column headers recovered", sst.get("columns") == 55, f"{sst.get('columns')} columns")
+check("locations read as rooms (incl. the second TOILET)",
+      sst.get("locations") == 14, f"{sst.get('locations')} locations")
+check("every column reconciles with the printed GRAND TOTAL",
+      sst.get("columns_reconciled") == sst.get("columns_checked") == 55,
+      f"{sst.get('columns_reconciled')}/{sst.get('columns_checked')}")
+_auto = [c for c in sch_prev["columns"]
+         if (c.get("suggested_project_item_id") or c.get("suggested_master_item_id"))
+         and not c.get("match_ambiguous") and (c.get("match_confidence") or 0) >= 0.5]
+check("columns auto-mapped to the estimate / Master CSR", len(_auto) >= 5,
+      f"{len(_auto)} auto-linked, {sum(1 for c in sch_prev['columns'] if c.get('match_ambiguous'))} flagged for confirmation")
+check("no page/text warnings", not sch_prev.get("warnings"), "; ".join(sch_prev.get("warnings", []))[:80])
+
+st, sch_imp = call(f"/api/projects/{PID}/import-schedule", "POST",
+                   {"filename": "sample-schedule.pdf", "parsed": sch_prev}, token=ETOK)
+check("schedule imported", st == 200 and sch_imp.get("doc_id"), json.dumps(sch_imp)[:90])
+check("all 14 locations became project rooms", sch_imp.get("locations") == 14)
+DOC = sch_imp.get("doc_id")
+
+st, vwl = call(f"/api/projects/{PID}/verify", token=ETOK)
+vt = vwl.get("totals", {})
+check("room-wise worklist built", st == 200 and len(vwl.get("rooms", [])) == 14, f"{vt.get('cells')} quantities")
+check("nothing verified yet", vt.get("pending") == vt.get("cells") and vt.get("kept") == 0)
+
+# print reconciliation = estimate vs schedule
+st, rec = call(f"/api/projects/{PID}/reconciliation", token=ETOK)
+check("reconciliation sheet built", st == 200 and rec["totals"]["scheduled_items"] > 0,
+      f"{rec['totals']['scheduled_items']} scheduled items")
+check("unlinked columns surfaced for manual mapping", rec["totals"]["unmapped_columns"] >= 1,
+      f"{rec['totals']['unmapped_columns']} columns")
+
+# link one unmapped column to a Master CSR item, then verify it
+orphan = rec["orphans"][0]
+st, sug = call(f"/api/csr/suggest?q={urllib.parse.quote(orphan['col_label'])}&fy=2024-25&region=Nashik", token=ETOK)
+cand = (sug.get("results") or [{}])[0]
+st, mp = call(f"/api/schedule-docs/{DOC}/columns/{orphan['column_order']}/map", "POST",
+              {"master_item_id": cand.get("id")}, token=ETOK)
+check("unlinked column mapped to Master CSR", st == 200 and mp.get("item_code"), f"{orphan['col_label']} -> {mp.get('item_code')}")
+
+st, vwl = call(f"/api/projects/{PID}/verify", token=ETOK)
+cell = next(c for rm in vwl["rooms"] for c in rm["items"] if c["project_item_id"])
+st, kept = call(f"/api/schedule-cells/{cell['id']}/verify", "POST", {"action": "keep"}, token=ETOK)
+check("KEEP writes a measurement at the schedule quantity",
+      st == 200 and kept["status"] == "kept" and kept["measurement_id"] and kept["qty"] == cell["qty"],
+      f"sched {cell['qty']} -> {kept.get('qty')}")
+
+other = next(c for rm in vwl["rooms"] for c in rm["items"]
+             if c["project_item_id"] and c["id"] != cell["id"] and c["qty"] > 1)
+st, changed = call(f"/api/schedule-cells/{other['id']}/verify", "POST",
+                   {"action": "change", "actual_qty": 1, "note": "site count 1"}, token=ETOK)
+check("CHANGE records the actual quantity", st == 200 and changed["status"] == "changed" and changed["qty"] == 1,
+      f"schedule {other['qty']} -> actual 1")
+st, same = call(f"/api/schedule-cells/{cell['id']}/verify", "POST",
+                {"action": "change", "actual_qty": cell["qty"]}, token=ETOK)
+check("an entered actual equal to the schedule is treated as KEEP", same.get("status") == "kept")
+st, undo = call(f"/api/schedule-cells/{other['id']}/verify", "POST", {"action": "pending"}, token=ETOK)
+check("verification can be reset", undo.get("status") == "pending")
+st, redo = call(f"/api/schedule-cells/{other['id']}/verify", "POST",
+                {"action": "change", "actual_qty": 2}, token=ETOK)
+
+room = vwl["rooms"][0]
+st, bulk = call(f"/api/schedule-docs/{DOC}/verify-bulk", "POST",
+                {"action": "keep", "location_ids": [room["location_id"]]}, token=ETOK)
+check("one-tap 'all as per schedule' for a room", st == 200 and bulk.get("verified", 0) >= 1,
+      f"{bulk.get('verified')} quantities kept")
+
+st, vwl2 = call(f"/api/projects/{PID}/verify", token=ETOK)
+check("worklist progress advances", vwl2["totals"]["pending"] < vwl2["totals"]["cells"],
+      f"{vwl2['totals']['progress_pct']}% verified")
+st, meas = call(f"/api/projects/{PID}/measurements", token=ETOK)
+marked = [m for m in meas["measurements"] if (m.get("notes") or "").startswith("[Schedule")]
+check("schedule verification wrote real measurements", len(marked) >= 3, f"{len(marked)} rows")
+st, xl, _ = call(f"/api/projects/{PID}/reconciliation.xlsx", raw=True, token=ETOK), None, None
+check("control sheet exports to Excel", st[0] == 200 and len(st[1]) > 4000, f"{len(st[1])} bytes")
+
+st, sch_txt = call(f"/api/projects/{PID}/parse-schedule-text", "POST",
+                   {"text": "Location\tItem\tUnit\tQty\nHALL\tLED panel 18W\tNos\t27\nTOILET\tEx. Fan\tNos\t1"}, token=ETOK)
+check("paste mode reads a schedule table", st == 200 and sch_txt.get("ok"), sch_txt.get("engine", ""))
+
 print("\n[9] Flow 6 - Form-23 MB generation")
 req = urllib.request.Request(f"{BASE}/api/projects/{PID}/form23.pdf")
 req.add_header("Authorization", "Bearer " + ETOK)
@@ -231,7 +316,7 @@ check("unauthenticated writes rejected", st in (401, 403))
 
 print("\n[12] cleanup - remove every artifact this test created")
 st, r = call(f"/api/projects/{PID}", "DELETE", token=ATOK)
-check("project deleted (cascade)", st == 200, "removed FAT project")
+check("project deleted (cascade: items, rooms, measurements, schedule docs)", st == 200, "removed FAT project")
 st, r = call(f"/api/projects/{PID}", token=ATOK)
 check("deleted project no longer visible", st == 404)
 st, r = call("/api/csr/versions?fy=2025-26&region=Nashik", "DELETE", token=ATOK)

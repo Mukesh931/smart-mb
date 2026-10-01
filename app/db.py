@@ -228,6 +228,62 @@ CREATE TABLE IF NOT EXISTS parse_jobs (
     created_at   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS schedule_docs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    filename     TEXT,
+    engine       TEXT,                    -- pymupdf-rotated-matrix | grid-matrix | grid-long-table ...
+    orientation  TEXT,                    -- locations_rows | locations_cols
+    title        TEXT,
+    name_of_work TEXT,
+    estimate_no  TEXT,
+    stats        TEXT,                    -- JSON  {columns, locations, cells, columns_reconciled ...}
+    warnings     TEXT,                    -- JSON list
+    raw_json     TEXT,                    -- full parse payload (audit / re-import)
+    status       TEXT DEFAULT 'imported', -- imported | verified
+    created_by   INTEGER,
+    created_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sched_docs_project ON schedule_docs (project_id);
+
+CREATE TABLE IF NOT EXISTS schedule_locations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id     INTEGER NOT NULL REFERENCES schedule_docs(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL,
+    floor      TEXT,
+    name       TEXT NOT NULL,
+    sort_order INTEGER DEFAULT 0,
+    row_total  REAL DEFAULT 0,
+    room_id    INTEGER REFERENCES rooms(id) ON DELETE SET NULL,
+    match_score REAL DEFAULT 0,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sched_loc_doc ON schedule_locations (doc_id);
+
+CREATE TABLE IF NOT EXISTS schedule_cells (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id           INTEGER NOT NULL REFERENCES schedule_docs(id) ON DELETE CASCADE,
+    project_id       INTEGER NOT NULL,
+    location_id      INTEGER NOT NULL REFERENCES schedule_locations(id) ON DELETE CASCADE,
+    column_order     INTEGER NOT NULL,
+    col_label        TEXT NOT NULL,
+    qty              REAL DEFAULT 0,
+    project_item_id  INTEGER REFERENCES project_items(id) ON DELETE SET NULL,
+    master_item_id   INTEGER REFERENCES master_items(id) ON DELETE SET NULL,
+    item_code        TEXT,
+    match_confidence REAL DEFAULT 0,
+    match_method     TEXT,
+    verify_status    TEXT DEFAULT 'pending',   -- pending | kept | changed | not_applicable
+    actual_qty       REAL,
+    measurement_id   INTEGER REFERENCES measurements(id) ON DELETE SET NULL,
+    note             TEXT,
+    checked_by       INTEGER,
+    checked_at       TEXT,
+    UNIQUE (doc_id, location_id, column_order)
+);
+CREATE INDEX IF NOT EXISTS idx_sched_cells_doc ON schedule_cells (doc_id);
+CREATE INDEX IF NOT EXISTS idx_sched_cells_item ON schedule_cells (project_item_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER,

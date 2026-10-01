@@ -67,7 +67,8 @@ globalThis.URL.revokeObjectURL = () => {};
 const driver = `
 globalThis.__T = { S, DEMO, render, viewDashboard, viewCSR, viewProjects, viewProject, viewAdmin,
   enterDemo, shell, measureSheet, extraItemSheet, csrItemSheet, renderImportPreview, tabImport, tabReports,
-  tabChecklist, tabMeasurements, tabDeviations, tabOverview, renderLogin, badgeFor };
+  tabChecklist, tabMeasurements, tabDeviations, tabOverview, renderLogin, badgeFor,
+  tabVerify, svRoomSheet, svLinkSheet, svImportPanel, svRenderPreview, svChip };
 `;
 const errors = [];
 process.on('unhandledRejection', (e) => errors.push('unhandled rejection: ' + (e && e.message)));
@@ -148,6 +149,7 @@ await step('project detail renders (overview tab)', async () => {
 });
 
 for (const [tab, needle] of [['import', 'Reconciliation'],
+  ['verify', 'room-wise verification'],
   ['checklist', 'Measurement checklist'], ['measurements', 'measurement entries'],
   ['deviations', 'Deviation alerts' && 'Item-wise deviation'], ['reports', 'Form No. 23']]) {
   await step(`project tab: ${tab}`, async () => {
@@ -155,6 +157,7 @@ for (const [tab, needle] of [['import', 'Reconciliation'],
     T.S.proj.tab = tab;
     const proj = T.DEMO.project;
     if (tab === 'import') await T.tabImport(el, proj);
+    else if (tab === 'verify') await T.tabVerify(el, proj, T.DEMO.verify);
     else if (tab === 'checklist') await T.tabChecklist(el, proj, T.DEMO.checklist);
     else if (tab === 'measurements') await T.tabMeasurements(el, proj);
     else if (tab === 'deviations') await T.tabDeviations(el, proj);
@@ -163,6 +166,50 @@ for (const [tab, needle] of [['import', 'Reconciliation'],
     return expect(el.innerHTML, needle.split(' ')[0], needle);
   });
 }
+
+await step('site-verify: room list renders schedule quantities', async () => {
+  const el = makeEl('v-verify-rooms');
+  T.S.verify.section = 'rooms';
+  await T.tabVerify(el, T.DEMO.project, T.DEMO.verify);
+  await new Promise((r) => setTimeout(r, 60));
+  const sb = document.getElementById('sv-body').innerHTML;
+  const roomCount = (T.DEMO.verify.rooms || []).length;
+  if (!roomCount) throw new Error('demo snapshot has no schedule rooms');
+  if (!sb.includes('Verify at site')) throw new Error('per-room verify button missing');
+  if (!sb.includes('pending')) throw new Error('pending badge missing');
+  return `${roomCount} rooms, ${T.DEMO.verify.totals.cells} quantities, ${T.DEMO.verify.totals.pending} pending`;
+});
+
+await step('site-verify: estimate vs schedule control sheet renders', async () => {
+  const el = makeEl('v-verify-recon');
+  T.S.verify.section = 'recon';
+  await T.tabVerify(el, T.DEMO.project, T.DEMO.verify);
+  await new Promise((r) => setTimeout(r, 60));
+  const sb = document.getElementById('sv-body').innerHTML;
+  return expect(expect(sb, 'Item-wise control sheet', 'control sheet') && sb, 'Schedule qty', 'schedule column');
+});
+
+await step('site-verify: room verification sheet opens with keep/actual actions', async () => {
+  const room = T.DEMO.verify.rooms[0];
+  await T.svRoomSheet(T.DEMO.project, room, T.DEMO.verify);
+  await new Promise((r) => setTimeout(r, 80));
+  const sh = lastSheet();
+  return expect(expect(sh, 'verify against the descriptive schedule', 'sheet title') && sh,
+    'As per schedule', 'keep action');
+});
+
+await step('site-verify: column linking sheet opens', async () => {
+  await T.svLinkSheet(T.DEMO.project, T.DEMO.verify, null);
+  await new Promise((r) => setTimeout(r, 80));
+  return expect(lastSheet(), 'Link schedule columns', 'linking sheet');
+});
+
+await step('site-verify: import panel renders when no schedule exists', async () => {
+  const el = makeEl('v-verify-import');
+  T.svImportPanel(el, T.DEMO.project);
+  return expect(expect(el.innerHTML, 'descriptive schedule', 'upload card') && el.innerHTML,
+    'Read pasted table', 'paste fallback');
+});
 
 await step('measurement capture sheet opens', async () => {
   const item = T.DEMO.checklist.items[0];

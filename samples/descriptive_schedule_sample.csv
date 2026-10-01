@@ -1,0 +1,16 @@
+Location,Item,Unit,Qty
+(GROUND FLOOR),,,
+ENTRANCE,Conduit Light / fan / bell point,Point,7
+ENTRANCE,Additional points,Nos,4
+ENTRANCE,LED panel 18W,Nos,7
+HALL,Conduit Light / fan / bell point,Point,9
+HALL,Concealed Fan Point,Point,4
+HALL,Plug Point,Nos,2
+HALL,LED panel 18W,Nos,27
+TOILET,Conduit Light / fan / bell point,Point,2
+TOILET,Ex. Fan,Nos,1
+MAIN HALL,Conduit Light / fan / bell point,Point,20
+MAIN HALL,Ceiling Fan 1200 mm,Nos,6
+MAIN HALL,LED panel 18W,Nos,40
+TOTAL,,,
+GRAND TOTAL,,,

@@ -13,6 +13,8 @@ const S = {
   demo: false,
   csr: { fy: '', region: '', q: '', category: '', chapter: '', page: 0, limit: 40 },
   proj: { id: null, tab: 'overview', room: null, data: null },
+  verify: { docId: null, onlyPending: false, section: 'rooms' },
+  schedulePreview: null,
   importPreview: null,
   adminTab: 'master',
 };
@@ -79,6 +81,11 @@ function demoLookup(path, method) {
     [/^\/projects\/(\d+)$/, (m) => (Number(m[1]) === DEMO.project.project.id ? DEMO.project : null)],
     [/^\/projects\/(\d+)\/items$/, () => ({ items: DEMO.items })],
     [/^\/projects\/(\d+)\/checklist$/, () => DEMO.checklist],
+    [/^\/projects\/(\d+)\/verify$/, () => DEMO.verify],
+    [/^\/projects\/(\d+)\/reconciliation$/, () => DEMO.reconciliation],
+    [/^\/projects\/(\d+)\/reconciliation\.xlsx$/, () => null],
+    [/^\/projects\/(\d+)\/schedules$/, () => ({ docs: (DEMO.verify && DEMO.verify.docs) || [] })],
+    [/^\/schedule-docs\/(\d+)$/, () => DEMO.schedule_doc],
     [/^\/projects\/(\d+)\/deviations$/, () => DEMO.deviations],
     [/^\/projects\/(\d+)\/measurements$/, () => ({ measurements: DEMO.measurements, count: DEMO.measurements.length, total_amount: 0 })],
     [/^\/admin\/overview$/, () => DEMO.admin],
@@ -576,8 +583,10 @@ Terrace / External | Corridor & External Area"></textarea></div>
 async function viewProject(view, id) {
   if (!id) { view.innerHTML = `<div class="empty">No project selected</div>`; return; }
   S.proj.id = id;
-  const [p, checklist] = await Promise.all([
-    api(`/api/projects/${id}`), api(`/api/projects/${id}/checklist${S.proj.room ? '?room_id=' + S.proj.room : ''}`)]);
+  const [p, checklist, verify] = await Promise.all([
+    api(`/api/projects/${id}`), api(`/api/projects/${id}/checklist${S.proj.room ? '?room_id=' + S.proj.room : ''}`),
+    api(`/api/projects/${id}/verify`).catch(() => ({ totals: { pending: 0, cells: 0 }, docs: [], rooms: [] }))]);
+  S.proj.verifyData = verify;
   S.proj.data = p;
   const pr = p.project;
   setTitle(pr.name, `${pr.project_code} · ${pr.division || ''}`);
@@ -614,7 +623,8 @@ async function viewProject(view, id) {
       </div>
       <div class="bd tight" style="padding:10px 12px">
         <div class="tabs" id="ptabs">
-          ${[['overview', 'Overview'], ['import', 'Smart Import'], ['checklist', `Checklist (${checklist.totals.done}/${checklist.totals.items})`],
+          ${[['overview', 'Overview'], ['import', 'Smart Import'], ['verify', `Site Verify${(verify.totals && verify.totals.pending) ? ' (' + verify.totals.pending + ')' : ''}`],
+      ['checklist', `Checklist (${checklist.totals.done}/${checklist.totals.items})`],
       ['measurements', 'Measurements'], ['deviations', `Deviations (${p.critical_deviations})`], ['reports', 'Form-23 & Reports']]
       .map(([k, l]) => `<button data-act="ptab" data-t="${k}" class="${tab === k ? 'on' : ''}">${l}</button>`).join('')}
         </div>
@@ -626,6 +636,7 @@ async function viewProject(view, id) {
   body.innerHTML = loading();
   if (tab === 'overview') return tabOverview(body, p, checklist);
   if (tab === 'import') return tabImport(body, p);
+  if (tab === 'verify') return tabVerify(body, p, verify);
   if (tab === 'checklist') return tabChecklist(body, p, checklist);
   if (tab === 'measurements') return tabMeasurements(body, p);
   if (tab === 'deviations') return tabDeviations(body, p);
@@ -1534,3 +1545,501 @@ window.addEventListener('hashchange', () => { if (S.token || S.demo) render(); e
   if (!location.hash) location.hash = '#/dashboard';
   render();
 })();
+
+/* ============================================================================
+   SITE VERIFY - descriptive schedule reconciliation
+   The descriptive schedule lists every room / floor of the building with its own
+   quantities.  The engineer walks room by room: quantities that match the schedule
+   are kept with one tap; only the ones that differ need the actual figure.
+   ========================================================================== */
+function svChip(cell) {
+  if (cell.verify_status === 'kept') return `<span class="badge ok">✓ as per schedule</span>`;
+  if (cell.verify_status === 'changed') return `<span class="badge warn">changed → ${smartNum(cell.actual_qty)}</span>`;
+  if (cell.verify_status === 'not_applicable') return `<span class="badge">n/a</span>`;
+  return `<span class="badge">pending</span>`;
+}
+
+async function tabVerify(body, p, wl) {
+  const pr = p.project;
+  wl = await api(`/api/projects/${pr.id}/verify`).catch(() => wl);
+  if (!wl || !wl.docs || !wl.docs.length) return svImportPanel(body, pr);
+  const t = wl.totals || { cells: 0, pending: 0, kept: 0, changed: 0, progress_pct: 0 };
+  const rec = await api(`/api/projects/${pr.id}/reconciliation`).catch(() => null);
+  const sec = S.verify.section;
+  body.innerHTML = `
+    <div class="card" style="margin-bottom:14px">
+      <div class="bd">
+        <div class="row between" style="align-items:flex-start">
+          <div>
+            <div class="row"><b style="font-size:15px">Descriptive schedule · room-wise verification</b>
+              <span class="badge brand">${esc(wl.docs[0].filename || 'schedule')}</span>
+              <span class="badge">${esc(wl.docs[0].engine || '')}</span></div>
+            <div class="small muted" style="margin-top:5px">${esc((wl.docs[0].name_of_work || '').slice(0, 140))}</div>
+          </div>
+          <div class="row">
+            <button class="btn sm" data-act="sv-import-again">${ICON.up} Another schedule</button>
+            ${wl.docs.length > 1 ? `<select class="i" id="sv-doc" style="max-width:220px">${wl.docs.map((d) => `<option value="${d.id}">${esc(d.filename)} · ${d.checked}/${d.cells}</option>`).join('')}</select>` : ''}
+          </div>
+        </div>
+        <div class="grid g4" style="margin-top:14px">
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Rooms / locations</div><div class="val sm">${t.locations || wl.rooms.length}</div><div class="foot">from the descriptive schedule</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Verified</div><div class="val sm">${t.kept + t.changed} <span class="muted" style="font-size:14px">/ ${t.cells}</span></div><div class="foot">${t.kept} as per schedule · ${t.changed} changed to actual</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Pending</div><div class="val sm" style="color:${t.pending ? 'var(--warn)' : 'var(--ok)'}">${t.pending}</div><div class="foot">quantities still to be seen at site</div></div>
+          <div class="kpi" style="padding:8px 0"><div class="lbl">Schedule value</div><div class="val sm">₹ ${inr((rec && rec.totals.schedule_amount) || 0, 0)}</div><div class="foot">at Master CSR rates</div></div>
+        </div>
+        <div class="progress ${t.progress_pct < 100 ? 'warn' : ''}" style="margin-top:12px"><i style="width:${Math.min(100, t.progress_pct)}%"></i></div>
+      </div>
+      <div class="bd tight" style="padding:10px 12px">
+        <div class="tabs" id="svtabs">
+          ${[['rooms', 'Rooms'], ['recon', 'Estimate vs Schedule'], ['docs', 'Schedule files']]
+      .map(([k, l]) => `<button data-act="sv-sec" data-t="${k}" class="${sec === k ? 'on' : ''}">${l}</button>`).join('')}
+        </div>
+      </div>
+    </div>
+    <div id="sv-body"></div>`;
+  const sb = document.getElementById('sv-body');
+  body.querySelectorAll('[data-act="sv-sec"]').forEach((b) => b.addEventListener('click', () => {
+    S.verify.section = b.dataset.t; tabVerify(body, p, wl);
+  }));
+  body.querySelector('[data-act="sv-import-again"]')?.addEventListener('click', () => svImportPanel(body, pr));
+  const sel = body.querySelector('#sv-doc');
+  if (sel) sel.addEventListener('change', () => { S.verify.docId = Number(sel.value); tabVerify(body, p, wl); });
+  if (sec === 'rooms') svRenderRooms(sb, pr, wl);
+  else if (sec === 'recon') svRenderRecon(sb, rec, wl, pr);
+  else svRenderDocs(sb, pr, wl);
+}
+
+/* ------------------------------------------------------- import & preview */
+function svImportPanel(body, pr, note) {
+  body.innerHTML = `
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="hd">${ICON.ruler}<h3>Upload the descriptive schedule</h3></div>
+        <div class="bd stack">
+          <div class="notice info">${ICON.shield}<div>The descriptive schedule carries the <b>rooms, floors and location-wise quantities</b> of the whole building.
+            It is read as a matrix — <b>columns are work items, rows are rooms</b> — with the rotated column headers recovered from the PDF, and every column is checked against the printed
+            <b>GRAND TOTAL</b> before you see it.</div></div>
+          ${note ? `<div class="notice warn">${ICON.warn}<div>${esc(note)}</div></div>` : ''}
+          <div><label class="f">Schedule file (PDF · scanned PDF · Excel · CSV)</label>
+            <input class="i" type="file" id="sv-file" accept=".pdf,.xlsx,.xlsm,.csv,.txt"></div>
+          <div class="row">
+            <button class="btn pri" data-act="sv-parse">${ICON.up} Read descriptive schedule</button>
+            <button class="btn" data-act="sv-sample">Try the sample (Ahilyabai Holkar Sabhamandap)</button>
+          </div>
+          <div class="hr"></div>
+          <label class="f">…or paste the schedule table (mobile fallback for a scan)</label>
+          <textarea class="i" id="sv-text" style="min-height:96px"
+            placeholder="Location	Item	Unit	Qty&#10;HALL	Conduit Light / fan point	Point	9&#10;HALL	LED panel 18W	Nos	27&#10;TOILET	Ex. Fan	Nos	1"></textarea>
+          <div class="row"><button class="btn" data-act="sv-parse-text">${ICON.sparkle} Read pasted table</button>
+            <span class="small muted">Columns can be in any order — they are matched by header name.</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>What happens next</h3></div>
+        <div class="bd small stack">
+          <div><b>1 · Rooms & floors</b><div class="muted">Every location in the schedule becomes a room of the project (matched to existing rooms by exact name).</div></div>
+          <div><b>2 · Item mapping</b><div class="muted">Each schedule column is matched to the estimate item and hence to the Master CSR — description, unit and rate come from the database.</div></div>
+          <div><b>3 · Control sheet</b><div class="muted">Estimate quantity vs descriptive schedule quantity vs actual measured, item by item.</div></div>
+          <div><b>4 · Room-wise verification</b><div class="muted">At site: <b>keep</b> what matches the schedule, <b>change</b> only what differs. A change writes a measurement, so Form-23 and the deviation statement follow automatically.</div></div>
+        </div>
+      </div>
+    </div>
+    <div id="sv-preview" style="margin-top:14px"></div>`;
+  const f = body.querySelector('#sv-file'), tx = body.querySelector('#sv-text');
+  body.querySelector('[data-act="sv-parse"]')?.addEventListener('click', async () => {
+    if (!f || !f.files || !f.files[0]) { toast('Choose the descriptive schedule file first', 'bad'); return; }
+    await svRunParse(pr, { file: f.files[0] }, body);
+  });
+  body.querySelector('[data-act="sv-parse-text"]')?.addEventListener('click', async () => {
+    const text = (tx.value || '').trim();
+    if (text.length < 10) { toast('Paste the schedule table first', 'bad'); return; }
+    await svRunParse(pr, { text }, body);
+  });
+  body.querySelector('[data-act="sv-sample"]')?.addEventListener('click', async () => {
+    const blob = await fetch('/api/samples/descriptive_schedule_sample.pdf').then((r) => r.blob()).catch(() => null);
+    if (!blob) { toast('Sample not reachable — use paste mode instead', 'warn'); return; }
+    await svRunParse(pr, { file: new File([blob], 'descriptive_schedule_sample.pdf') }, body);
+  });
+  if (S.schedulePreview) svRenderPreview(S.schedulePreview, pr);
+}
+
+async function svRunParse(pr, src, body) {
+  const prev = body.querySelector('#sv-preview');
+  prev.innerHTML = loading();
+  try {
+    let data;
+    if (src.file) {
+      const fd = new FormData(); fd.append('file', src.file);
+      data = await api(`/api/projects/${pr.id}/parse-schedule`, { method: 'POST', form: fd });
+    } else {
+      data = await api(`/api/projects/${pr.id}/parse-schedule-text`, { method: 'POST', body: { text: src.text } });
+    }
+    S.schedulePreview = data.ok ? data : null;
+    if (!data.ok) {
+      prev.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>Could not read this schedule automatically.</b>
+        <br>${esc((data.warnings || []).join(' ') || '')} ${esc(data.hint || '')}</div></div>`;
+      toast('Schedule not recognised', 'bad');
+      return;
+    }
+    svRenderPreview(data, pr);
+    toast(`Read ${data.stats.locations} locations × ${data.stats.columns} items`, 'ok');
+  } catch (err) {
+    prev.innerHTML = `<div class="notice bad">${ICON.warn}<div>${esc(err.message)}</div></div>`;
+  }
+}
+
+function svRenderPreview(data, pr) {
+  const box = document.getElementById('sv-preview');
+  if (!box) return;
+  const st = data.stats || {};
+  const cols = (data.columns || []).filter((c) => Object.keys(c.cells || {}).length);
+  const linked = data.columns.filter((c) => c.suggested_project_item_id);
+  const weak = cols.filter((c) => (c.match_confidence || 0) < 0.5 || c.match_ambiguous);
+  const locs = data.locations || [];
+  const cellOf = (loc) => {                       // rooms × items mini-matrix
+    const map = {};
+    data.columns.forEach((c) => { if (c.cells && c.cells[loc.order] != null) map[c.order] = c.cells[loc.order]; });
+    return map;
+  };
+  box.innerHTML = `
+    <div class="card" style="margin-bottom:14px">
+      <div class="hd">${ICON.check}<h3>Parsed: ${locs.length} locations × ${st.columns} items (${st.cells} quantities)</h3>
+        <span class="badge ${st.columns_reconciled === st.columns_checked ? 'ok' : 'warn'}">${st.columns_reconciled}/${st.columns_checked} columns reconcile with the printed GRAND TOTAL</span></div>
+      <div class="bd stack">
+        ${(data.warnings || []).length ? `<div class="notice warn">${ICON.warn}<div>${data.warnings.map(esc).join('<br>')}</div></div>` : ''}
+        <div class="notice ok">${ICON.check}<div>Every parsed quantity was cross-checked against the totals printed on the sheet — the columns that reconcile are safe to verify against.</div></div>
+        <div class="scrollx"><table class="tbl"><thead><tr><th>Location (row)</th><th>Floor</th><th class="num">Items</th><th class="num">Row total</th><th>Matrix</th></tr></thead><tbody>
+          ${locs.map((l) => {
+    const cs = cellOf(l);
+    const chips = Object.keys(cs).slice(0, 14).map((k) => `<span class="chip ghost" style="font-size:11px">${esc((data.columns[+k].label || '').slice(0, 18))} <b>${smartNum(cs[k])}</b></span>`).join('');
+    return `<tr><td><b>${esc(l.label)}</b></td><td class="small muted">${esc(l.floor || '—')}</td>
+              <td class="num">${Object.keys(cs).length}</td><td class="num">${smartNum(l.row_total)}</td>
+              <td>${chips}${Object.keys(cs).length > 14 ? `<span class="muted small">+${Object.keys(cs).length - 14} more</span>` : ''}</td></tr>`;
+  }).join('')}
+        </tbody></table></div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="hd"><h3>Column → item mapping</h3>
+        <span class="muted small">${data.columns.length} columns · ${data.columns.length - weak.length} auto-linked${weak.length ? ` · ${weak.length} need your confirmation` : ''}</span></div>
+      <div class="bd tight scrollx"><table class="tbl"><thead><tr><th>Schedule column</th><th class="num">Total</th><th>Matched item (Master CSR)</th><th>Confidence</th><th>Reconcile</th></tr></thead><tbody>
+        ${data.columns.map((c) => {
+    const qty = Object.values(c.cells || {}).reduce((a, b) => a + b, 0);
+    const conf = c.match_confidence || 0;
+    const isWeak = conf < 0.5 || c.match_ambiguous;
+    return `<tr>
+        <td><b>${esc(c.label)}</b></td><td class="num">${qty ? smartNum(qty) : '—'}</td>
+        <td>${c.suggested_item_code ? `<span class="pill-code">${esc(c.suggested_item_code)}</span> <span class="small">${esc((c.suggested_description || '').slice(0, 70))}</span>${c.match_ambiguous ? ' <span class="badge warn">confirm</span>' : ''}` : '<span class="muted small">not matched — link it after import</span>'}</td>
+        <td>${qty ? (isWeak ? `<span class="badge warn">check</span>` : conf ? `<span class="badge ${conf >= 0.6 ? 'ok' : 'info'}">${(conf * 100).toFixed(0)}%</span>` : '<span class="badge">—</span>') : '<span class="muted small">no quantity</span>'}</td>
+        <td>${c.total_match === true ? `<span class="badge ok">✓ adds up</span>` : c.total_match === false ? `<span class="badge bad">✗ differs</span>` : '<span class="muted small">—</span>'}</td></tr>`;
+  }).join('')}
+      </tbody></table></div>
+    </div>
+    <div class="card"><div class="bd row between">
+      <div class="small muted">Importing creates ${locs.length} room(s) in this project and stores ${st.cells} quantities for room-wise verification.</div>
+      <div class="row"><button class="btn" data-act="sv-discard">Discard</button>
+        <button class="btn pri" data-act="sv-import">${ICON.check} Import & start verification</button></div>
+    </div></div>`;
+  box.querySelector('[data-act="sv-discard"]')?.addEventListener('click', () => {
+    S.schedulePreview = null; box.innerHTML = ''; toast('Preview discarded');
+  });
+  box.querySelector('[data-act="sv-import"]')?.addEventListener('click', async () => {
+    const btn = box.querySelector('[data-act="sv-import"]');
+    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Importing…';
+    try {
+      const r = await api(`/api/projects/${pr.id}/import-schedule`, {
+        method: 'POST', body: { filename: data.filename || 'descriptive-schedule', parsed: data } });
+      S.schedulePreview = null;
+      toast(`Imported: ${r.locations} rooms, ${r.auto_mapped} items linked`, 'ok');
+      if (r.need_link && r.need_link.length) {
+        toast(`${r.need_link.length} column(s) need linking to the estimate`, 'warn', 6000);
+      }
+      S.verify.section = 'rooms';
+      render();
+    } catch (err) { toast(err.message, 'bad'); btn.disabled = false; btn.textContent = 'Import & start verification'; }
+  });
+}
+
+/* -------------------------------------------------------------- room list */
+function svRenderRooms(box, pr, wl) {
+  const t = wl.totals;
+  const rooms = S.verify.onlyPending ? wl.rooms.filter((r) => r.pending) : wl.rooms;
+  box.innerHTML = `
+    <div class="row between" style="margin-bottom:10px">
+      <div class="row">
+        <button class="chip ${S.verify.onlyPending ? 'on' : ''}" data-act="sv-only-pending">Only rooms with pending quantities</button>
+      </div>
+      <div class="small muted">Tap a room → check the schedule quantities → keep or change</div>
+    </div>
+    <div class="grid g-auto">
+      ${rooms.map((r) => `
+        <div class="card">
+          <div class="bd">
+            <div class="row between">
+              <div><b>${esc(r.name)}</b> ${r.floor ? `<span class="badge">${esc(r.floor)}</span>` : ''}</div>
+              ${r.pending ? `<span class="badge warn">${r.pending} pending</span>` : `<span class="badge ok">✓ verified</span>`}
+            </div>
+            <div class="small muted" style="margin:4px 0">${r.items.length} schedule item(s) · schedule total ${smartNum(r.schedule_total)}</div>
+            <div class="progress ${r.pending ? 'warn' : ''}"><i style="width:${r.progress_pct}%"></i></div>
+            <div class="row between small muted" style="margin-top:4px"><span>${r.kept} kept · ${r.changed} changed</span><span>${r.progress_pct}%</span></div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn pri" data-open="${r.location_id}">${ICON.ruler} Verify at site</button>
+              ${r.pending && r.items.filter((i) => i.verify_status === 'pending' && i.project_item_id).length
+      ? `<button class="btn" data-keepall="${r.location_id}">✓ All as per schedule</button>` : ''}
+            </div>
+          </div>
+        </div>`).join('') || `<div class="card"><div class="empty">${ICON.check}<div>Every room has been verified.</div></div></div>`}
+    </div>`;
+  box.querySelector('[data-act="sv-only-pending"]')?.addEventListener('click', () => {
+    S.verify.onlyPending = !S.verify.onlyPending; tabVerify(document.getElementById('view'), { project: pr }, null);
+  });
+  box.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => {
+    const room = wl.rooms.find((r) => String(r.location_id) === b.dataset.open);
+    svRoomSheet(pr, room, wl);
+  }));
+  box.querySelectorAll('[data-keepall]').forEach((b) => b.addEventListener('click', async () => {
+    const room = wl.rooms.find((r) => String(r.location_id) === b.dataset.keepall);
+    b.disabled = true; b.innerHTML = '<span class="spin"></span>…';
+    try {
+      const r = await api(`/api/schedule-docs/${wl.docs[0].id}/verify-bulk`, {
+        method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
+      toast(`${esc(room.name)}: ${r.verified} quantit${r.verified === 1 ? 'y' : 'ies'} confirmed as per schedule` + (r.failed.length ? ` · ${r.failed.length} need item linking` : ''), r.failed.length ? 'warn' : 'ok');
+      render();
+    } catch (err) { toast(err.message, 'bad'); b.disabled = false; }
+  }));
+}
+
+/* ------------------------------------------------------- room verify sheet */
+async function svRoomSheet(pr, room, wl) {
+  wl = await api(`/api/projects/${pr.id}/verify`).catch(() => wl);
+  room = wl.rooms.find((r) => r.location_id === room.location_id) || room;
+  const docId = wl.docs[0].id;
+  const unlinked = room.items.filter((i) => !i.project_item_id);
+  const bodyHtml = `
+    <div class="row between" style="margin-bottom:10px">
+      <div class="small muted">${room.items.length} item(s) · schedule total ${smartNum(room.schedule_total)} · ${room.kept} kept · ${room.changed} changed</div>
+      <div class="row">
+        <button class="btn sm" data-sv="allkeep">✓ All as per schedule</button>
+      </div>
+    </div>
+    ${unlinked.length ? `<div class="notice warn">${ICON.warn}<div><b>${unlinked.length} column(s) in this room are not linked to an estimate item yet</b>
+      (${unlinked.map((u) => esc(u.col_label)).slice(0, 4).join(', ')}${unlinked.length > 4 ? '…' : ''}).
+      <br><button class="btn sm" data-sv="link">Link them now</button></div></div>` : ''}
+    <div class="stack" style="margin-top:10px">
+      ${room.items.map((c) => `
+        <div class="sv-row" data-cell="${c.id}" style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:${c.verify_status === 'pending' ? 'var(--surface)' : c.verify_status === 'changed' ? '#fffbeb' : '#f6fdf9'}">
+          <div class="row between">
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:600">${esc(c.col_label)}</div>
+              <div class="small muted">${c.item_code ? `<span class="pill-code">${esc(c.item_code)}</span> ` : '<span class="badge bad">unlinked</span> '}
+                ${esc((c.item_description || '').slice(0, 62))}${c.unit ? ` · ${esc(c.unit)}` : ''}</div>
+            </div>
+            <div style="text-align:right;white-space:nowrap">
+              <div class="lbl small muted">schedule</div><div style="font-size:18px;font-weight:700">${smartNum(c.qty)}</div></div>
+          </div>
+          <div class="row between" style="margin-top:8px">
+            <div>${svChip(c)}${c.actual_qty != null && c.verify_status === 'changed' ? ` <span class="small muted">schedule was ${smartNum(c.qty)} → actual ${smartNum(c.actual_qty)}</span>` : ''}</div>
+            <div class="row">
+              ${c.verify_status === 'pending' ? `
+                <button class="btn ok sm" data-keep="${c.id}">✓ As per schedule</button>
+                <span class="row" style="gap:6px">
+                  <input class="i" type="number" step="any" inputmode="decimal" style="width:84px" value="${smartNum(c.qty)}" data-input="${c.id}">
+                  <button class="btn sm pri" data-change="${c.id}">Actual</button></span>`
+    : `<button class="btn sm" data-undo="${c.id}">Re-do</button>`}
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>`;
+  sheet({
+    title: `${room.name} — verify against the descriptive schedule`,
+    body: bodyHtml, wide: true,
+    footer: `<span class="small muted">Keep = matches the schedule · Actual = the quantity you measured</span>
+             <button class="btn" data-act="close-sheet">Done</button>`,
+    onOpen: (el) => {
+      if (!el.querySelector('.sv-row') && !el.querySelector('[data-sv="allkeep"]')) return;
+      el.querySelector('[data-sv="allkeep"]')?.addEventListener('click', async () => {
+        try {
+          const r = await api(`/api/schedule-docs/${docId}/verify-bulk`, { method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
+          toast(`${r.verified} quantit${r.verified === 1 ? 'y' : 'ies'} kept as per schedule`, 'ok');
+          svRoomSheet(pr, room, wl);
+        } catch (err) { toast(err.message, 'bad'); }
+      });
+      el.querySelector('[data-sv="link"]')?.addEventListener('click', () => svLinkSheet(pr, wl, room.items.find((i) => !i.project_item_id)));
+      el.querySelectorAll('[data-keep]').forEach((b) => b.addEventListener('click', async () => {
+        b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+        try {
+          await api(`/api/schedule-cells/${b.dataset.keep}/verify`, { method: 'POST', body: { action: 'keep' } });
+          toast('Kept as per schedule', 'ok');
+          svRoomSheet(pr, room, wl);
+        } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = '✓ As per schedule'; }
+      }));
+      el.querySelectorAll('[data-change]').forEach((b) => b.addEventListener('click', async () => {
+        const inp = el.querySelector(`[data-input="${b.dataset.change}"]`);
+        const v = parseFloat(inp.value);
+        if (isNaN(v) || v < 0) { toast('Enter the actual quantity measured at site', 'bad'); return; }
+        b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+        try {
+          const r = await api(`/api/schedule-cells/${b.dataset.change}/verify`, {
+            method: 'POST', body: { action: 'change', actual_qty: v, note: 'actual at site' } });
+          toast(r.status === 'changed' ? `Changed to actual ${smartNum(v)} · measurement recorded` :
+            `Matches the schedule — kept`, 'ok');
+          svRoomSheet(pr, room, wl);
+        } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = 'Actual'; }
+      }));
+      el.querySelectorAll('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
+        try {
+          await api(`/api/schedule-cells/${b.dataset.undo}/verify`, { method: 'POST', body: { action: 'pending' } });
+          svRoomSheet(pr, room, wl);
+        } catch (err) { toast(err.message, 'bad'); }
+      }));
+    },
+  });
+}
+
+/* ------------------------------------------------------------- link a column */
+async function svLinkSheet(pr, wl, cell) {
+  const docId = wl.docs[0].id;
+  const doc = await api(`/api/schedule-docs/${docId}`);
+  let parsedCols = [];
+  try { parsedCols = (JSON.parse(doc.raw_json || '{}').columns) || []; } catch (e) { parsedCols = []; }
+  const cells = doc.cells.filter((c) => !c.project_item_id);
+  const orders = [...new Set(cells.map((c) => c.column_order))];
+  const info = {}; orders.forEach((o) => { info[o] = cells.find((c) => c.column_order === o); });
+  const start = (cell && cell.column_order) || orders[0];
+  sheet({
+    title: 'Link schedule columns to Master CSR items',
+    wide: true,
+    body: `<div class="notice info">${ICON.shield}<div>These columns carry quantities but are not yet tied to an estimate item.
+      Matching a column attaches the <b>Master CSR description, unit and rate</b> — or creates an extra item for work that is in the schedule but not in the estimate abstract.</div></div>
+      <div class="row" style="margin:10px 0"><span class="small muted">${orders.length} column(s)</span>
+        <select class="i" id="sv-col" style="flex:1">${orders.map((o) => `<option value="${o}" ${o === start ? 'selected' : ''}>${esc(info[o].col_label)} — ${Object.keys(cells.filter((c) => c.column_order === o)).length ? smartNum(cells.filter((c) => c.column_order === o).map((c) => c.qty).reduce((a, b) => a + b, 0)) : 0} nos</option>`).join('')}</select></div>
+      <div class="bd tight" style="padding-top:0">
+        <div id="sv-suggest"></div>
+        <label class="f" style="margin-top:10px">…or search the Master CSR</label>
+        <input class="i" id="sv-q" placeholder="e.g. exhaust fan, LED panel, 6A switch"></div>
+      <div id="sv-results" class="stack" style="margin-top:8px"></div>`,
+    footer: `<button class="btn" data-act="close-sheet">Close</button>`,
+    onOpen: (el) => {
+      const sel = el.querySelector('#sv-col'), q = el.querySelector('#sv-q'), res = el.querySelector('#sv-results');
+      const sugBox = el.querySelector('#sv-suggest');
+      if (!sel || !q || !res || !sugBox) return;
+      const paintSuggest = () => {
+        const pc = parsedCols.find((c) => Number(c.order) === Number(sel.value));
+        const alts = (pc && pc.alternatives) || [];
+        sugBox.innerHTML = alts.length ? `
+          <div class="small muted" style="margin:6px 0 4px">The wording of this column most resembles these estimate / CSR items — tap the right one:</div>
+          <div class="stack" style="gap:6px">
+            ${alts.map((a) => `
+              <div class="row between" style="border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:${a.kind === 'project_item' ? '#f6fdf9' : 'var(--surface)'}">
+                <div style="flex:1;min-width:0"><span class="pill-code">${esc(a.code || '')}</span>
+                  <span class="badge ${a.kind === 'project_item' ? 'ok' : 'info'}">${a.kind === 'project_item' ? 'in estimate' : 'Master CSR'}</span>
+                  <span class="small">${esc((a.description || '').slice(0, 92))}</span>
+                  <div class="small muted">${esc(a.unit || '')}${a.rate ? ` · ₹ ${inr(a.rate)}` : ''} · wording match ${(a.score * 100).toFixed(0)}%</div></div>
+                <button class="btn sm ${a.kind === 'project_item' ? 'pri' : ''}" data-alt='${JSON.stringify({ k: a.kind, id: a.id })}'>Use this</button>
+              </div>`).join('')}
+          </div>` : `<div class="small muted" style="margin:6px 0 4px">No close match in the wording — search the Master CSR below and link the correct item, or create an extra item for work that is not in the estimate abstract.</div>`;
+        sugBox.querySelectorAll('[data-alt]').forEach((b) => b.addEventListener('click', async () => {
+          const spec = JSON.parse(b.dataset.alt);
+          b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+          try {
+            const payload = spec.k === 'project_item' ? { project_item_id: spec.id } : { master_item_id: spec.id };
+            const out = await api(`/api/schedule-docs/${docId}/columns/${sel.value}/map`, { method: 'POST', body: payload });
+            toast(`Linked to ${out.item_code}`, 'ok');
+            svLinkSheet(pr, wl, null);
+          } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = 'Use this'; }
+        }));
+      };
+      let timer;
+      const run = async () => {
+        const term = q.value.trim() || info[Number(sel.value)].col_label;
+        res.innerHTML = loading();
+        try {
+          const r = await api(`/api/csr/suggest?q=${encodeURIComponent(term)}&fy=${encodeURIComponent(pr.csr_fy || '')}&region=${encodeURIComponent(pr.csr_region || '')}&limit=6`);
+          res.innerHTML = (r.results || []).map((it) => `
+            <div class="row between" style="border:1px solid var(--line);border-radius:10px;padding:8px 10px">
+              <div style="flex:1;min-width:0"><span class="pill-code">${esc(it.item_code)}</span>
+                <span class="small">${esc((it.description || '').slice(0, 92))}</span>
+                <div class="small muted">${esc(it.unit)} · ₹ ${inr(it.rate)}</div></div>
+              <div class="row" style="gap:6px">
+                <button class="btn sm pri" data-master="${it.id}">Link as estimate item</button></div></div>`).join('')
+            || `<div class="muted small">No suggestion for “${esc(term)}”. Try different words, or create an extra item below.</div>`;
+          res.querySelectorAll('[data-master]').forEach((b) => b.addEventListener('click', async () => {
+            b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+            try {
+              const out = await api(`/api/schedule-docs/${docId}/columns/${sel.value}/map`, { method: 'POST', body: { master_item_id: Number(b.dataset.master) } });
+              toast(`Linked to ${out.item_code}`, 'ok');
+              svLinkSheet(pr, wl, null);
+            } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = 'Link'; }
+          }));
+        } catch (err) { res.innerHTML = `<div class="notice bad">${ICON.warn}<div>${esc(err.message)}</div></div>`; }
+      };
+      q.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(run, 320); });
+      sel.addEventListener('change', () => { q.value = ''; paintSuggest(); run(); });
+      paintSuggest();
+      run();
+    },
+  });
+}
+
+/* -------------------------------------------------------- reconciliation view */
+function svRenderRecon(box, rec, wl, pr) {
+  if (!rec) { box.innerHTML = `<div class="empty">No data</div>`; return; }
+  const rows = rec.rows.filter((r) => r.locations.length || r.measured_qty);
+  const t = rec.totals;
+  box.innerHTML = `
+    <div class="notice info" style="margin-bottom:12px">${ICON.shield}<div>The descriptive schedule is the quantity actually distributed over the building.
+      Where it differs from the estimate abstract, the difference is shown here <b>before</b> the joint measurement — so you only visit the rooms that differ.</div></div>
+    <div class="grid g3" style="margin-bottom:14px">
+      <div class="card kpi"><div class="lbl">Estimate (tendered)</div><div class="val sm">₹ ${inr(t.tendered_amount, 0)}</div><div class="foot">all project items</div></div>
+      <div class="card kpi"><div class="lbl">Descriptive schedule</div><div class="val sm">₹ ${inr(t.schedule_amount, 0)}</div><div class="foot">${t.scheduled_items} item(s) distributed room-wise</div></div>
+      <div class="card kpi"><div class="lbl">To be verified</div><div class="val sm" style="color:${t.pending_cells ? 'var(--warn)' : 'var(--ok)'}">${t.pending_cells}</div>
+        <div class="foot">${t.changed_cells} changed so far${t.unmapped_columns ? ` · ${t.unmapped_columns} unlinked column(s)` : ''}</div></div>
+    </div>
+    ${rec.orphans.length ? `<div class="card" style="margin-bottom:14px"><div class="bd"><div class="row between">
+        <div class="small"><b>${rec.orphans.length} schedule quantities are not linked to an estimate item yet.</b>
+        <div class="muted">Link them to pull the legal description and rate from the Master CSR.</div></div>
+        <button class="btn sm pri" data-act="sv-link-open">Link columns</button></div></div></div>` : ''}
+    <div class="card"><div class="hd"><h3>Item-wise control sheet</h3><span class="muted small">estimate vs schedule vs actual</span></div>
+      <div class="bd tight scrollx"><table class="tbl"><thead><tr>
+        <th>Item</th><th>Description (Master CSR)</th><th class="num">Rate</th>
+        <th class="num">Estimate qty</th><th class="num">Schedule qty</th><th class="num">Δ sched−est</th>
+        <th class="num">Actual so far</th><th>Rooms</th></tr></thead><tbody>
+        ${rows.map((r) => {
+    const d = r.schedule_vs_tendered;
+    return `<tr><td class="nowrap"><span class="pill-code">${esc(r.item_code)}</span>${r.is_non_schedule ? ' <span class="badge ns">NS</span>' : ''}</td>
+          <td class="small">${esc((r.description || '').slice(0, 84))}</td>
+          <td class="num nowrap">₹ ${inr(r.rate, 0)}</td>
+          <td class="num">${smartNum(r.tendered_qty)} <span class="muted small">${esc(r.unit || '')}</span></td>
+          <td class="num"><b>${smartNum(r.schedule_qty)}</b></td>
+          <td class="num" style="color:${Math.abs(d) < 0.001 ? 'var(--muted)' : (d > 0 ? 'var(--bad)' : 'var(--ok)')}">${d > 0 ? '+' : ''}${smartNum(d)}</td>
+          <td class="num">${smartNum(r.measured_qty)}</td>
+          <td class="small muted">${r.locations.length ? `${r.locations.filter((l) => l.verify_status !== 'pending').length}/${r.locations.length} verified` : '—'}</td></tr>`;
+  }).join('') || `<tr><td colspan="8"><div class="empty">No schedule quantities imported yet.</div></td></tr>`}
+      </tbody></table></div></div>
+    <div class="card" style="margin-top:14px"><div class="bd">
+      <div class="row between"><div class="small muted">Room totals were checked against the printed GRAND TOTAL when the schedule was read.</div>
+        <button class="btn sm" data-act="dl" data-path="/api/projects/${rec.project_id}/reconciliation.xlsx" data-name="Schedule_Reconciliation.xlsx">Export</button></div>
+    </div></div>`;
+  box.querySelector('[data-act="sv-link-open"]')?.addEventListener('click', () => svLinkSheet(pr || { csr_fy: '', csr_region: '' }, wl, null));
+}
+
+function svRenderDocs(box, pr, wl) {
+  box.innerHTML = `<div class="stack">
+    ${wl.docs.map((d) => `
+      <div class="card"><div class="bd">
+        <div class="row between">
+          <div><b>${esc(d.filename || 'schedule')}</b> <span class="badge brand">${esc(d.engine || '')}</span>
+            <div class="small muted">${d.locations} locations · ${d.cells} quantities · ${d.checked} verified (${d.progress_pct}%) · imported ${dtt(d.created_at)} by ${esc(d.uploaded_by_name || '—')}</div>
+            ${(d.warnings || []).length ? `<div class="small" style="color:var(--warn)">${d.warnings.map(esc).join('<br>')}</div>` : ''}</div>
+          <div class="row">
+            <button class="btn sm danger" data-del="${d.id}">Remove</button></div>
+        </div>
+        <div class="progress ${d.progress_pct < 100 ? 'warn' : ''}" style="margin-top:8px"><i style="width:${d.progress_pct}%"></i></div>
+      </div></div>`).join('')}
+  </div>`;
+  box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Remove this descriptive schedule and its verification state?')) return;
+    try { await api(`/api/schedule-docs/${b.dataset.del}`, { method: 'DELETE' }); toast('Schedule removed'); render(); }
+    catch (err) { toast(err.message, 'bad'); }
+  }));
+}

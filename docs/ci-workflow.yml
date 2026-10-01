@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test suite (API + UI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build sample input files
+        run: python -m tools.make_samples
+
+      - name: Seed the Master CSR database
+        run: python -c "from app import seed; seed.ensure_seed()"
+
+      - name: Start the app and run the end-to-end smoke test
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 --log-level warning &
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:8010/api/health >/dev/null && break
+            sleep 1
+          done
+          python -m tools.smoke_test http://127.0.0.1:8010
+
+      - name: Headless UI render test (every screen)
+        run: node tools/ui_test.mjs
+
+      - name: Verify the standalone bundle builds and has no external assets
+        run: |
+          python -m tools.build_standalone
+          python - <<'PY'
+          import re
+          html = open("web/smart-mb-standalone.html", encoding="utf-8").read()
+          assert "style.css" not in html and "app.js" not in html, "bundle still references external assets"
+          assert 'id="demo-snapshot"' in html, "demo snapshot missing"
+          print("standalone bundle OK:", len(html)//1024, "KiB")
+          PY

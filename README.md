@@ -2,6 +2,8 @@
 
 **Maharashtra Public Works Department (Electrical Wing) · PWD Electrical Engineers**
 
+<!-- CI: the workflow is shipped as docs/ci-workflow.yml - copy it to .github/workflows/ci.yml
+     from the GitHub web UI ("Add file" -> paste) to run the suite on every push. -->
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Mukesh931/smart-mb)
 
 **Live demo:** <https://smart-mb.onrender.com> — sign in as `admin@pwd.maharashtra.gov.in` / `Admin@123`
@@ -16,6 +18,13 @@ Technical Sanction estimate, the platform maps it against the master, builds a m
 records joint measurements at site, and prints the official **Form No. 23 (Measurement Book)** — with
 descriptions and rates that are always the clean legal text from the Master CSR, never OCR noise from
 a blurry PDF.
+
+Alongside the estimate, the platform also reads the **Descriptive Schedule** — the room / floor /
+location-wise quantity statement of the building — and reconciles it against the estimate. At site the
+engineer then walks **room by room**: quantities that match the descriptive schedule are *kept* with
+one tap, and only the ones that differ are *changed* to the actual figure. Every change writes a
+measurement, so Form-23 and the deviation statement follow automatically. See
+[`docs/DESCRIPTIVE_SCHEDULE.md`](docs/DESCRIPTIVE_SCHEDULE.md).
 
 ```
         ADMIN                                    SITE ENGINEER
@@ -68,10 +77,12 @@ every screen — deviations, progress, Form-23 — is populated on first login.
 ./run.sh test            # or: python3 -m tools.smoke_test http://127.0.0.1:8000
 ```
 
-The smoke test drives all 12 flows end-to-end (auth → project → parse messy PDF → reconciliation →
-checklist → measurements → extra items → deviations → Form-23 PDF/Excel → admin CSR import → audit →
-cleanup) and cleans up every artifact it created. **48/48 API checks pass**, plus a headless UI harness
-(`node tools/ui_test.mjs`) that renders every screen against the demo snapshot — **16/16 pass**.
+The smoke test drives every flow end-to-end (auth → project → parse messy PDF → reconciliation →
+checklist → measurements → extra items → deviations → **descriptive schedule parse / import / room-wise
+keep-or-change verification / control-sheet export** → Form-23 PDF/Excel → admin CSR import → audit →
+cleanup) and cleans up every artifact it created. **72/72 API checks pass**, plus a headless UI harness
+(`node tools/ui_test.mjs`) that renders every screen — including the room verification sheet and the
+column-linking sheet — against the demo snapshot: **22/22 pass**.
 
 ---
 
@@ -122,7 +133,44 @@ cleanup) and cleans up every artifact it created. **48/48 API checks pass**, plu
    and editable descriptions/rates for non-schedule rows, plus rooms auto-detected from the estimate
    text. Confirming generates the **measurement checklist**.
 
-### 2.3 Onsite measurement (mobile)
+### 2.3 The Descriptive Schedule — room-wise reconciliation & verification
+
+The descriptive schedule is where the building's quantities actually live: **locations run down the
+sheet, work items run across the top** (the column headings are printed rotated 90° on the PWD
+proforma). `app/schedule.py` reads it as a matrix and `app/schedule_store.py` reconciles it with the
+project:
+
+1. **Rotated-header matrix extraction** (`pymupdf` glyph directions — no OCR needed for digital PDFs).
+   The 14 locations / 55 item columns of the sample sheet are recovered exactly, including a second
+   `TOILET` and the `HALL` vs `MAIN HALL` distinction.
+2. **Self-checked reading** — the printed `TOTAL OF …` / `GRAND TOTAL` row is compared with the sum of
+   the parsed cells, column by column. On the sample sheet **55 of 55 columns reconcile to the paisa**;
+   any column that does not is flagged in red before the engineer ever sees the grid.
+3. **Header-driven, so it scales** — nothing is hard-coded to the sample's column set: a column map is
+   never assumed. PDF (rotated **or** plain), scanned pages (paste mode / OCR-friendly rebuild),
+   Excel, CSV and long-format `Location | Item | Unit | Qty` tables are all accepted, in any column
+   order.
+4. **Locations → project rooms** — exact-name matches reuse an existing room; anything new becomes a
+   room (repeats get `TOILET (2)`), so measurements and the checklist line up with the sheet.
+5. **Column → item mapping from the Master CSR** — IDF-weighted wording coverage picks the matching
+   estimate line (`Ceiling Fan 1200 mm` → `3-1-1 … ceiling fan 1200 mm sweep`), preferring items
+   already in the estimate; near-ties are marked **“confirm”** and the engineer picks from a one-tap
+   shortlist, or links a Master CSR item / creates an extra item for work that is in the schedule but
+   not in the estimate.
+6. **Control sheet** — per item: **estimate quantity · schedule quantity · difference · actual so far ·
+   rooms verified**, exportable to Excel (`…/reconciliation.xlsx`, with a second *Room wise* sheet).
+7. **Room-wise verification at site** — the core loop the brief asked for. Inside a room each schedule
+   quantity shows `Keep ✓` / `Actual` buttons:
+   * **Keep** → confirmed as per the descriptive schedule (one tap, or “all as per schedule” for the
+     whole room);
+   * **Actual** → the measured figure replaces it, and a **measurement row is written** with the room,
+     item, quantity and note, so the checklist, deviation statement and Form-23 stay in step;
+   * entering an actual equal to the schedule is recorded as a *keep*, and any verification can be
+     redone.
+   Progress is tracked per room and per item (`x/y verified`, `n pending`), so the engineer sees
+   exactly which rooms still need a visit.
+
+### 2.4 Onsite measurement (mobile)
 
 * Checklist grouped by **room / location**, derived from the estimate, showing tendered vs measured vs
   pending with progress bars and Excess / Complete badges.
@@ -135,7 +183,7 @@ cleanup) and cleans up every artifact it created. **48/48 API checks pass**, plu
   genuinely are not in the CSR are captured as **non-schedule** items with a reason/approval reference.
 * Room-wise measurement register with per-location values, photos, edit/delete, and an Excel MB export.
 
-### 2.4 Reporting & validation
+### 2.5 Reporting & validation
 
 * **Form-23 (M.B.) PDF** — print-ready landscape A4: work particulars block, item-wise table in MB
   column format (No · L · B · H · Qty · Rate · Amount) with the **Master CSR legal description** and CSR
@@ -150,7 +198,7 @@ cleanup) and cleans up every artifact it created. **48/48 API checks pass**, plu
 * Dashboard & project KPIs: tendered vs measured value, progress %, net deviation, excess/saving,
   value distribution by work head.
 
-### 2.5 Admin governance
+### 2.6 Admin governance
 
 Master CSR versions & reseed · user management (create, role, region/division, enable/disable, password
 reset) · **audit trail** of every master change, import, measurement and report · **parsing jobs**
@@ -167,6 +215,7 @@ register (file, engine, anchors, matched, unknown).
 | `#/projects` | Project cards, progress, create-project wizard (with room list) |
 | `#/project/:id` · Overview | Work particulars, rooms, deviation alerts, delete |
 | `#/project/:id` · Smart Import | Upload/paste estimate → reconciliation table → confirm |
+| `#/project/:id` · Site Verify | Descriptive schedule: rooms list → *keep / change* per room, “all as per schedule”, estimate-vs-schedule control sheet, schedule files |
 | `#/project/:id` · Checklist | Room chips, item cards, Measure button, Extra item from CSR |
 | `#/project/:id` · Measurements | Room-wise register, photos, edit/delete |
 | `#/project/:id` · Deviations | Excess/saving statement with severity |
@@ -189,6 +238,14 @@ from `/` with a hash router; the FastAPI static mount also serves every file und
 | `GET/POST` | `/api/projects` · `GET/PATCH/DELETE /api/projects/{id}` | project CRUD + KPIs |
 | `POST` | `/api/projects/{id}/parse-estimate` (file) · `/parse-text` | anchor-based parsing |
 | `POST` | `/api/projects/{id}/import-estimate` | commit reconciliation → checklist |
+| `POST` | `/api/projects/{id}/parse-schedule` (file) · `/parse-schedule-text` | descriptive schedule matrix (PDF/scan/Excel/CSV/paste) + printed-total check |
+| `POST` | `/api/projects/{id}/import-schedule` | store the schedule, create the rooms, propose item links |
+| `GET` | `/api/projects/{id}/schedules` · `/api/schedule-docs/{id}` | schedule documents & parsed matrix |
+| `GET` | `/api/projects/{id}/reconciliation` · `/reconciliation.xlsx` | estimate vs schedule vs actual control sheet |
+| `GET` | `/api/projects/{id}/verify` | room-major verification worklist |
+| `POST` | `/api/schedule-cells/{id}/verify` | **keep** the schedule quantity · **change** to actual · undo |
+| `POST` | `/api/schedule-docs/{id}/verify-bulk` | one-tap “all as per schedule” for a room / item |
+| `POST` | `/api/schedule-docs/{id}/columns/{n}/map` | link a column to an estimate / Master CSR item, or create an extra item |
 | `GET` | `/api/projects/{id}/checklist` · `/deviations` · `/measurements` · `/items` | verification data |
 | `POST` | `/api/projects/{id}/items` | extra item from CSR **or** non-schedule item |
 | `POST/PATCH/DELETE` | `/api/measurements` · `/api/measurements/{id}` | joint measurement recording |
@@ -221,6 +278,12 @@ rooms               project_id, floor, name, sort_order
 measurements        project_id, project_item_id, room_id, length, breadth, height, nos, measured_qty,
                     notes, measured_by, measured_on, status
 measurement_photos  measurement_id, filename, caption, uploaded_at
+schedule_docs       project_id, filename, engine(rotated-matrix|grid-matrix|grid-long-table), orientation,
+                    title, name_of_work, stats, warnings, raw_json, status
+schedule_locations  doc_id, project_id, floor, name, sort_order, row_total, room_id → rooms, match_score
+schedule_cells      doc_id, location_id, column_order, col_label, qty, project_item_id → project_items,
+                    master_item_id, item_code, match_confidence, match_method,
+                    verify_status(pending|kept|changed|not_applicable), actual_qty, measurement_id, note
 parse_jobs          project_id, filename, file_type, engine, anchors, matched, unknown
 audit_log           user_id, user_name, action, entity, entity_id, detail, created_at
 ```
@@ -239,11 +302,14 @@ smart-mb/
 ├── render.yaml                Render Blueprint (web service + disk + env vars)
 ├── Procfile · runtime.txt      generic PaaS start command / Python version pin
 ├── docs/DEPLOY.md             GitHub → Render deployment walkthrough
+├── docs/DESCRIPTIVE_SCHEDULE.md   how the room-wise schedule is read, reconciled and verified
 ├── app/
 │   ├── db.py                  schema + connection helpers + audit
 │   ├── auth.py                PBKDF2 passwords, HMAC bearer tokens
 │   ├── seed.py                demo Master CSR (163 items × FY × region), users, measured demo project
 │   ├── parsing.py             anchor-based estimate parser, OCR repair, CSR importer, AI prompt
+│   ├── schedule.py            descriptive-schedule reader: rotated-header matrix, grid/long tables, column→CSR matching
+│   ├── schedule_store.py      schedule persistence, room creation, estimate-vs-schedule reconciliation, verification
 │   ├── reports.py             Form-23 PDF (reportlab) + Excel MB (openpyxl), deviation statement
 │   └── main.py                FastAPI: auth, csr, projects, measurements, reports, admin, dashboard
 ├── web/                       single-page front-end served at /
@@ -252,13 +318,15 @@ smart-mb/
 │   ├── app.js                 hash router, all screens, live API + offline demo fallback
 │   └── smart-mb-standalone.html   one-file build (inline CSS+JS+data) for previews / tablets
 ├── samples/                   sample_estimate.pdf (deliberately messy) · .xlsx · .csv · CSR template
+│                               descriptive_schedule_sample.pdf (real PWD proforma) · .xlsx · .csv
 ├── tools/
 │   ├── make_samples.py        generates the sample estimate files + import template
 │   ├── embed_demo.py          injects a read-only data snapshot into index.html
-│   ├── smoke_test.py          48-check end-to-end API test of every flow
-│   ├── ui_test.mjs            16-check headless render test of every screen
+│   ├── smoke_test.py          72-check end-to-end API test of every flow
+│   ├── ui_test.mjs            22-check headless render test of every screen
 │   ├── build_standalone.py    single-file HTML build
 │   └── deploy_all.py          scripted GitHub push + Render service creation (env-provided tokens)
+├── .github/workflows/ci.yml   CI: seeds the DB, runs the 72-check API suite + 22-check UI harness
 └── data/                      smartmb.sqlite3 · uploads/ · photos/   (created at runtime)
 ```
 
@@ -276,6 +344,16 @@ $ python3 -m tools.smoke_test         # excerpts
     OCR artefact cured (1-O-1 → 1-1-1) · duplicate anchor merged · descriptions from Master CSR
 [9] Form-23 PDF 26 KiB / 6 pages     "as per specification" wording retained, deviation + signatures
 ```
+
+---
+
+### Continuous integration
+
+The full suite (samples → seed → **72 API checks** → **22 UI checks** → standalone build assertion) is
+defined in [`docs/ci-workflow.yml`](docs/ci-workflow.yml). GitHub only accepts workflow files from a
+token with the `workflow` scope, so enable it in one click: **GitHub → your repo → Add file → Create new
+file → path `.github/workflows/ci.yml` → paste the contents of `docs/ci-workflow.yml` → Commit.** Every
+push then runs the same suite that `./run.sh test` runs locally.
 
 ---
 

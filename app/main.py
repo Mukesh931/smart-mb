@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db, parsing, reports, seed
+from . import auth, db, parsing, reports, schedule as sch, schedule_store, seed
 from .db import PHOTO_DIR, SAMPLE_DIR, UPLOAD_DIR, audit, ex, json_load, now_iso, q, q1, rows_to_dicts
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -879,6 +879,209 @@ def deviations(pid: int, user: dict = Depends(current_user)):
             "review": [r for r in rows if r["severity"] == "review"],
         },
     }
+
+
+# ======================================================== DESCRIPTIVE SCHEDULE
+class ScheduleCellVerifyIn(BaseModel):
+    action: str = Field(..., description="keep | change | not_applicable")
+    actual_qty: Optional[float] = None
+    note: str = ""
+    push_measurement: bool = True
+
+
+class ScheduleBulkVerifyIn(BaseModel):
+    action: str = "keep"
+    room_id: Optional[int] = None
+    column_order: Optional[int] = None
+    location_ids: Optional[list[int]] = None
+    actuals: Optional[dict[str, float]] = None
+
+
+class ScheduleColumnMapIn(BaseModel):
+    project_item_id: Optional[int] = None
+    master_item_id: Optional[int] = None
+    create_item: bool = False
+    item_code: str = ""
+    description: str = ""
+    unit: str = ""
+    rate: float = 0
+
+
+class ScheduleImportIn(BaseModel):
+    filename: str = "descriptive-schedule"
+    parsed: dict
+    column_map: dict[str, dict] | None = None
+
+
+@app.post("/api/projects/{pid}/parse-schedule")
+async def parse_schedule(pid: int, file: UploadFile = File(...), user: dict = Depends(current_user)):
+    """Upload the descriptive schedule (PDF / scanned PDF / Excel / CSV) and preview the matrix.
+
+    Nothing is written yet: the engineer sees the parsed rooms x items grid, the printed-total
+    reconciliation and the proposed item mapping, then confirms."""
+    p = q1("SELECT * FROM projects WHERE id=?", (pid,))
+    if not p:
+        raise HTTPException(404, "Project not found")
+    raw = await file.read()
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", file.filename or "descriptive_schedule.pdf")
+    path = os.path.join(UPLOAD_DIR, f"sch_{pid}_{uuid.uuid4().hex[:8]}_{safe}")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+    try:
+        parsed = sch.parse_descriptive_schedule(path)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not read the descriptive schedule: {exc}")
+    if not parsed.get("ok"):
+        return JSONResponse(status_code=200, content={
+            "ok": False, "engine": parsed.get("engine"), "warnings": parsed.get("warnings", []),
+            "hint": parsed.get("hint") or ("Upload the schedule as Excel/CSV, or paste the table text "
+                                           "in Preview mode."),
+            "filename": safe, "project_id": pid})
+    items = schedule_store.project_items(pid)
+    master = schedule_store._master_index(p["csr_fy"], p["csr_region"])
+    parsed["columns"] = sch.map_columns(parsed["columns"], items, master)
+    parsed.update({"ok": True, "filename": safe, "project_id": pid,
+                   "csr": {"fy": p["csr_fy"], "region": p["csr_region"]},
+                   "estimate_items": len(items),
+                   "reconciled_note": (f"{parsed['stats']['columns_reconciled']} of "
+                                       f"{parsed['stats']['columns_checked']} item columns add up exactly to the "
+                                       f"printed GRAND TOTAL.") if parsed["stats"].get("columns_checked") else ""})
+    audit(user, "SCHEDULE_PARSED", "projects", pid,
+          {"file": safe, "engine": parsed.get("engine"), "locations": parsed["stats"].get("locations"),
+           "columns": parsed["stats"].get("columns"), "reconciled": parsed["stats"].get("columns_reconciled")})
+    return parsed
+
+
+@app.post("/api/projects/{pid}/parse-schedule-text")
+def parse_schedule_text(pid: int, body: dict, user: dict = Depends(current_user)):
+    """Paste the descriptive schedule table (mobile fallback when only a scan is available)."""
+    p = q1("SELECT * FROM projects WHERE id=?", (pid,))
+    if not p:
+        raise HTTPException(404, "Project not found")
+    text = (body or {}).get("text") or ""
+    if len(text.strip()) < 10:
+        raise HTTPException(400, "Paste the schedule table - one location per row, tab or 2+ spaces between columns")
+    parsed = sch.parse_schedule_text(text)
+    if not parsed.get("ok"):
+        return JSONResponse(status_code=200, content={"ok": False, "engine": parsed.get("engine"),
+                                                      "warnings": parsed.get("warnings", []),
+                                                      "hint": "Use a header row such as: Location | Item | Unit | Qty"})
+    items = schedule_store.project_items(pid)
+    master = schedule_store._master_index(p["csr_fy"], p["csr_region"])
+    parsed["columns"] = sch.map_columns(parsed["columns"], items, master)
+    parsed.update({"ok": True, "filename": "pasted-schedule-text", "project_id": pid})
+    return parsed
+
+
+@app.post("/api/projects/{pid}/import-schedule")
+def import_schedule(pid: int, body: ScheduleImportIn, user: dict = Depends(current_user)):
+    """Confirm the preview: store the schedule, create the rooms and propose the item links."""
+    if not q1("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "Project not found")
+    parsed = body.parsed or {}
+    if not parsed.get("columns") or not parsed.get("locations"):
+        raise HTTPException(400, "The parsed schedule has no columns/locations to import")
+    column_map = {int(k): v for k, v in (body.column_map or {}).items() if str(k).isdigit()}
+    out = schedule_store.save_document(pid, body.filename, parsed, user, column_map)
+    audit(user, "SCHEDULE_IMPORT_CONFIRMED", "projects", pid, out)
+    return {"ok": True, **out}
+
+
+@app.get("/api/projects/{pid}/schedules")
+def list_schedules(pid: int, user: dict = Depends(current_user)):
+    if not q1("SELECT id FROM projects WHERE id=?", (pid,)):
+        raise HTTPException(404, "Project not found")
+    return {"docs": schedule_store.list_documents(pid)}
+
+
+@app.get("/api/schedule-docs/{did}")
+def get_schedule_doc(did: int, user: dict = Depends(current_user)):
+    doc = schedule_store.get_document(did)
+    return doc
+
+
+@app.delete("/api/schedule-docs/{did}")
+def delete_schedule_doc(did: int, user: dict = Depends(current_user)):
+    schedule_store.delete_document(did, user)
+    return {"ok": True}
+
+
+@app.get("/api/projects/{pid}/reconciliation")
+def reconciliation(pid: int, doc_id: Optional[int] = None, user: dict = Depends(current_user)):
+    """Estimate (tendered) vs descriptive schedule vs actual - the engineer's control sheet."""
+    return schedule_store.reconciliation(pid, doc_id)
+
+
+@app.get("/api/projects/{pid}/reconciliation.xlsx")
+def reconciliation_xlsx(pid: int, doc_id: Optional[int] = None, user: dict = Depends(current_user)):
+    """Excel control sheet: estimate vs descriptive schedule vs actual, item by item."""
+    from openpyxl import Workbook
+    p = q1("SELECT * FROM projects WHERE id=?", (pid,))
+    if not p:
+        raise HTTPException(404, "Project not found")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Estimate vs Schedule"
+    for row in schedule_store.reconciliation_rows(pid, doc_id):
+        ws.append(row)
+    widths = [12, 70, 8, 10, 12, 12, 14, 14, 14, 12, 12]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+    ws.freeze_panes = "A2"
+    # second sheet: room-wise detail
+    ws2 = wb.create_sheet("Room wise")
+    ws2.append(["Location", "Floor", "Item code", "Item", "Unit", "Schedule qty",
+                "Actual qty", "Status", "Note"])
+    docs = schedule_store.list_documents(pid)
+    for d in docs:
+        detail = schedule_store.get_document(d["id"])
+        rooms = {l["id"]: l for l in detail["locations"]}
+        for c in sorted(detail["cells"], key=lambda c: (rooms.get(c["location_id"], {}).get("sort_order", 0), c["column_order"])):
+            loc = rooms.get(c["location_id"], {})
+            ws2.append([loc.get("name", ""), loc.get("floor", ""), c.get("item_code") or "",
+                        c.get("col_label", ""), c.get("unit") or "", c.get("qty") or 0,
+                        c.get("actual_qty"), c.get("verify_status"), c.get("note") or ""])
+    for i, w in enumerate([22, 14, 12, 40, 8, 12, 12, 12, 30], start=1):
+        ws2.column_dimensions[chr(64 + i)].width = w
+    ws2.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", p["project_code"] or str(pid))
+    audit(user, "RECONCILIATION_EXPORTED", "projects", pid, {"format": "xlsx"})
+    return Response(content=buf.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="Schedule_Reconciliation_{safe}.xlsx"'})
+
+
+@app.get("/api/projects/{pid}/verify")
+def verify_worklist(pid: int, doc_id: Optional[int] = None, room_id: Optional[int] = None,
+                    only_pending: bool = False, user: dict = Depends(current_user)):
+    """Room-major verification worklist for the site phone."""
+    return schedule_store.verify_worklist(pid, doc_id, room_id, only_pending)
+
+
+@app.post("/api/schedule-cells/{cid}/verify")
+def verify_cell(cid: int, body: ScheduleCellVerifyIn, user: dict = Depends(current_user)):
+    """Keep the schedule quantity, or replace it with the actual measured at site."""
+    return schedule_store.verify_cell(cid, body.action, body.actual_qty, user, body.note,
+                                      body.push_measurement)
+
+
+@app.post("/api/schedule-docs/{did}/verify-bulk")
+def verify_bulk(did: int, body: ScheduleBulkVerifyIn, user: dict = Depends(current_user)):
+    """One-tap 'all as per schedule' for a room, a location list or a single item across rooms."""
+    return schedule_store.verify_bulk(did, user, room_id=body.room_id, column_order=body.column_order,
+                                      location_ids=body.location_ids, action=body.action, actuals=body.actuals)
+
+
+@app.post("/api/schedule-docs/{did}/columns/{column_order}/map")
+def map_schedule_column(did: int, column_order: int, body: ScheduleColumnMapIn, user: dict = Depends(current_user)):
+    """Attach a schedule column to an estimate item / Master CSR item, or create an extra item."""
+    return schedule_store.map_column(did, column_order, user, project_item_id=body.project_item_id,
+                                     master_item_id=body.master_item_id, create_item=body.create_item,
+                                     spec={"item_code": body.item_code, "description": body.description,
+                                           "unit": body.unit, "rate": body.rate})
 
 
 # =============================================================== MEASUREMENTS

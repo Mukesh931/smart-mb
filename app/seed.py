@@ -434,6 +434,59 @@ def seed_demo_project(engineer: dict | None = None) -> int | None:
     return pid
 
 
+def seed_demo_schedule(engineer: dict | None = None) -> dict | None:
+    """Attach the sample descriptive schedule to the demo project so the room-wise
+    verification screen has real data on a fresh install (and in the standalone demo)."""
+    import os
+    from . import schedule_store
+    pid = seed_demo_project(engineer)
+    if not pid or q1("SELECT id FROM schedule_docs WHERE project_id=? LIMIT 1", (pid,)):
+        return None
+    sample = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "samples", "descriptive_schedule_sample.pdf")
+    if not os.path.exists(sample):
+        return None
+    try:
+        from . import schedule as sch
+        parsed = sch.parse_descriptive_schedule(sample)
+        if not parsed.get("ok"):
+            return None
+        pr = dict(q1("SELECT * FROM projects WHERE id=?", (pid,)))
+        parsed["columns"] = sch.map_columns(parsed["columns"], schedule_store.project_items(pid),
+                                            schedule_store._master_index(pr["csr_fy"], pr["csr_region"]))
+        out = schedule_store.save_document(pid, "descriptive_schedule_sample.pdf", parsed, None)
+        _demo_verify(pid, out["doc_id"])
+        return out
+    except Exception:                       # never block startup because of the demo schedule
+        return None
+
+
+def _demo_verify(pid: int, doc_id: int) -> None:
+    """Show both end states in the demo data: the first location confirmed entirely as per
+    schedule, and two quantities in the next location corrected to the actual at site."""
+    from . import schedule_store
+    rows = q("""SELECT c.id, c.qty, l.name FROM schedule_cells c JOIN schedule_locations l ON l.id=c.location_id
+                WHERE c.doc_id=? AND c.project_item_id IS NOT NULL ORDER BY l.sort_order, c.column_order""",
+             (doc_id,))
+    by_room: dict[str, list] = {}
+    for r in rows:
+        by_room.setdefault(r["name"], []).append(r)
+    names = list(by_room)
+    if not names:
+        return
+    for r in by_room[names[0]]:
+        schedule_store.verify_cell(r["id"], "keep", None, None)
+    changed = 0
+    if len(names) > 1:
+        for r in by_room[names[1]]:
+            if changed >= 2:
+                break
+            if r["qty"] > 1:
+                schedule_store.verify_cell(r["id"], "change", max(1, r["qty"] - 2), None,
+                                           note="counted at site with the contractor representative")
+                changed += 1
+
+
 def ensure_seed() -> None:
     db.init_db()
     if not q1("SELECT id FROM master_items LIMIT 1"):
@@ -442,3 +495,6 @@ def ensure_seed() -> None:
         seed_users()
     if not q1("SELECT id FROM projects LIMIT 1"):
         seed_demo_project()
+        seed_demo_schedule()
+    if q1("SELECT id FROM schedule_docs LIMIT 1") is None and q1("SELECT id FROM projects LIMIT 1"):
+        seed_demo_schedule()
