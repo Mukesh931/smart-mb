@@ -1,0 +1,26 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+# Deploy: push this repo, then "New + > Blueprint" and point it at the repository.
+services:
+  - type: web
+    name: smart-mb
+    runtime: python
+    plan: starter                 # 'free' works for a demo but has no persistent disk
+    region: singapore             # closest Render region to Maharashtra
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /api/health
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python3 -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --log-level warning
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.0"
+      - key: SMARTMB_SECRET            # signs session tokens — generated once, kept secret
+        generateValue: true
+      - key: SMARTMB_DATA_DIR          # persistent disk mount for the Master CSR DB + photos
+        value: /var/data
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: smart-mb-data
+      mountPath: /var/data
+      sizeGB: 1
