@@ -49,10 +49,39 @@ def get_conn() -> sqlite3.Connection:
     if conn is None:
         conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        # FastAPI runs endpoints on a thread pool and several writers must queue rather
+        # than fail: the busy timeout goes on first, before anything that takes a lock.
+        conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            # WAL is a *persistent* database property.  Re-requesting it on every new
+            # connection needs an exclusive lock and deadlocks against another process
+            # holding a write (two workers, a script plus the server, a smoke test).
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            pass                                             # already WAL (or busy): fine
         _local.conn = conn
     return conn
+
+
+_LOCK_RETRIES = 6
+
+
+def _with_retry(fn, sql: str, params: Iterable[Any]):
+    """Run a statement, waiting out a concurrent writer instead of erroring."""
+    import sqlite3 as _sq
+    import time as _t
+    delay = 0.05
+    for attempt in range(_LOCK_RETRIES):
+        try:
+            return fn(sql, params)
+        except _sq.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            if attempt == _LOCK_RETRIES - 1:
+                raise
+            _t.sleep(delay)
+            delay = min(delay * 2, 1.0)
 
 
 def q(sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
@@ -65,10 +94,13 @@ def q1(sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
 
 
 def ex(sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
-    conn = get_conn()
-    cur = conn.execute(sql, tuple(params))
-    conn.commit()
-    return cur
+    def _run(sql_: str, params_: Iterable[Any]) -> sqlite3.Cursor:
+        conn = get_conn()
+        cur = conn.execute(sql_, tuple(params_))
+        conn.commit()
+        return cur
+
+    return _with_retry(_run, sql, params)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:
@@ -309,6 +341,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     conn = get_conn()
+    try:
+        # a fresh database: set the journal mode once, here, where there is a single writer
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     conn.executescript(SCHEMA)
     conn.commit()
     _migrate(conn)

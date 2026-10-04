@@ -2,6 +2,9 @@
 Builds the sample input files used in the demo (and by the automated test):
   samples/sample_estimate.xlsx        - clean estimate abstract (Excel)
   samples/sample_estimate.csv         - same, CSV
+  samples/sample_work_abstract.pdf    - printed-table "Work Abstract" (Sr.No | Quantity |
+                                        Description | Rate | Unit | Amount) used as the
+                                        regression fixture for the pdf-column-table engine
   samples/sample_estimate.pdf         - "scanned-looking" abstract PDF, deliberately
                                         messy: wrapped rows, drifting columns, one OCR
                                         artefact (1-O-1 instead of 1-1-1) and one
@@ -167,8 +170,65 @@ def make_csr_template() -> str:
     return path
 
 
+# ---------------------------------------------------------------- "Work Abstract" sample
+ABSTRACT_ROWS = [
+    ("1-3-14", "Supplying and erecting PVC insulated PVC round sheathed 1.5 sq.mm (30 no. x 0.25 mm dia.) 3 core flexible multi stranded copper Industrial cable for voltage grade up to 1.1 kV", "m", 55, 61.00),
+    ("2-4-5", "Supplying and erecting integrated LED street light fitting 60W IP65 & IK08 class with die-cast aluminium housing, 6600 lumens, inbuilt surge protection, 3 years warranty", "each", 11, 4970.00),
+    ("5-3-3", "Supplying, erecting and marking SPMCB 6A to 32A B-series with rated short-circuit breaking capacity", "each", 11, 173.00),
+    ("7-1-5", "Supplying, erecting & terminating FR XLPE insulated galvanised steel wire armoured cable", "m", 347, 127.00),
+    ("7-6-9", "Supplying and laying (including excavation) of suitable width earth trench with sand and brick protection", "m", 303, 210.00),
+    ("8-2-12", "Providing and erecting galvanised octagonal pole m high (clear height) with base plate and foundation", "each", 11, 15067.00),
+    ("8-2-21", "Providing and erecting galvanised 1000 mm single arm sword type bracket for street light fitting", "each", 11, 2718.00),
+    ("9-1-4", "Providing maintenance free chemical earthing with 3 m long electrode, back fill compound, test point and chamber cover", "Each", 12, 22030.00),
+    ("16-3-9", "Providing and fixing street light feeder pillar foundation considering safe soil bearing capacity", "Each", 11, 3684.00),
+]
+
+
+def make_abstract_pdf() -> str:
+    """A 'Work Abstract' in the shape real PWD abstracts use: Sr.No | Quantity |
+    Item Description (wrapping over several lines, code in brackets at the end) |
+    Rate | Unit | Amount, with printed Amount = qty x rate.  This is the layout the
+    pdf-column-table engine is built for, so it is kept as a regression fixture."""
+    path = os.path.join(SAMPLES, "sample_work_abstract.pdf")
+    doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=16 * mm, rightMargin=16 * mm,
+                            topMargin=14 * mm, bottomMargin=14 * mm, title="Work Abstract")
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle("body", parent=styles["Normal"], fontName="Helvetica", fontSize=8.6, leading=11)
+    small = ParagraphStyle("small", parent=body, fontSize=8)
+    head = ParagraphStyle("head", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=13, alignment=1)
+
+    data = [["Sr.No.", "Quantity", "Item Description", "Rate", "Unit", "Amount"]]
+    for i, (code, desc, unit, qty, rate) in enumerate(ABSTRACT_ROWS, start=1):
+        amount = qty * rate
+        data.append([str(i), f"{qty:.3f}",
+                     Paragraph(f"{desc}<br/>({code})", small),
+                     f"{rate:.2f}", unit, f"{amount:.2f}"])
+    total = sum(q * r for _c, _d, _u, q, r in ABSTRACT_ROWS)
+    data.append(["", "", Paragraph("<b>Total</b>", small), "", "", f"{total:.2f}"])
+
+    table = Table(data, colWidths=[13 * mm, 20 * mm, 92 * mm, 17 * mm, 12 * mm, 22 * mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#5b6b7c")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dce6ef")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ("ALIGN", (3, 1), (5, -1), "RIGHT"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 1), (-1, -1), 8.6),
+        ("TOPPADDING", (0, 1), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+    ]))
+    doc.build([Paragraph("Work Abstract", head), Spacer(1, 5 * mm),
+               Paragraph("Estimate No. : 1512 of 2025-2026<br/>"
+                         "Name of work : Providing Repairs and Renovation to Street Lights at S. P. Bunglow, Jalgaon.",
+                         body),
+               Spacer(1, 4 * mm), table])
+    return path
+
+
 def make_all() -> dict:
-    return {"csv": make_csv(), "xlsx": make_xlsx(), "pdf": make_pdf(), "csr_template": make_csr_template()}
+    return {"csv": make_csv(), "xlsx": make_xlsx(), "pdf": make_pdf(),
+            "abstract_pdf": make_abstract_pdf(), "csr_template": make_csr_template()}
 
 
 if __name__ == "__main__":

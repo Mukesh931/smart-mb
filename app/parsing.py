@@ -423,10 +423,25 @@ def map_to_master(parsed: list[dict], master_index: dict[str, dict]) -> dict:
 
 
 def parse_estimate_text(text: str, master_index: dict[str, dict], *, merge: str = "max") -> dict:
-    """Master parse entry point.  merge: max | sum | first  (duplicate anchors)."""
+    """Text/anchor engine.  merge: max | sum | first  (duplicate anchors)."""
     anchors = find_anchors(text)
     qty_band = _detect_qty_column(text)
     parsed = extract_quantities(anchors, text, qty_band)
+    out = finish_parse(parsed, master_index, merge=merge)
+    out["engine"] = "anchor-regex-v1"
+    out["stats"]["qty_column_band"] = qty_band
+    return out
+
+
+def finish_parse(parsed: list[dict], master_index: dict[str, dict], *, merge: str = "max") -> dict:
+    """Merge duplicate item codes, map every row against the Master CSR, and build stats.
+
+    Shared by the text/anchor engine and the PDF column engine, so both produce the
+    exact same output contract."""
+    if not parsed:
+        return {"engine": "empty", "items": [], "unknown": [], "duplicates": [], "stats": {
+            "anchors_found": 0, "unique_codes": 0, "matched": 0, "unknown": 0, "low_confidence": 0,
+            "qty_column_band": None, "estimated_amount": 0.0, "duplicates": 0}, "ai_prompt": ""}
 
     # merge duplicate anchors (rate-analysis notes, page headers, TOC)
     merged: dict[str, dict] = {}
@@ -462,12 +477,12 @@ def parse_estimate_text(text: str, master_index: dict[str, dict], *, merge: str 
         "unknown": mapped["unknown"],
         "duplicates": duplicates,
         "stats": {
-            "anchors_found": len(anchors),
+            "anchors_found": len(parsed),
             "unique_codes": len(merged),
             "matched": len(mapped["items"]),
             "unknown": len(mapped["unknown"]),
             "low_confidence": sum(1 for r in mapped["items"] if r["confidence"] < 0.7),
-            "qty_column_band": qty_band,
+            "qty_column_band": None,
             "estimated_amount": round(est_amount, 2),
             "duplicates": len(duplicates),
         },
@@ -611,3 +626,212 @@ def parse_csr_rows(rows: list[list[Any]]) -> dict:
         })
     return {"ok": True, "columns": columns, "header_row": headers_idx + 1, "items": out,
             "errors": errors[:60], "error_count": len(errors)}
+
+
+# ===================================================================== PDF column engine
+# Real PWD abstracts are printed tables.  Reading them by *position* (which column a
+# number sits in, cross-checked against the printed Amount) is far more reliable than
+# guessing from the text stream: in a typical abstract the description wraps over five
+# lines while the quantity, rate, unit and amount all sit on the first line of the row.
+HEADER_ALIASES = {
+    "sr": ("sr", "sr.no", "sr.no.", "srno", "s.no", "sno", "s.no.", "sl", "sl.no", "no", "no."),
+    "qty": ("quantity", "qty", "quantities", "qnty"),
+    "desc": ("description", "particulars", "item", "itemdescription", "descriptionofitem", "name"),
+    "rate": ("rate", "rates", "unitrate", "rateperunit"),
+    "unit": ("unit", "units", "uom"),
+    "amount": ("amount", "value", "total", "cost", "amountrs", "amountinr"),
+}
+_NUM_RE = re.compile(r"^-?[\d,]+(?:\.\d+)?$")
+_CODE_IN_TEXT_RE = re.compile(r"\(?\b(\d{1,3}\s?[-–]\s?\d{1,3}\s?[-–]\s?\d{1,3})\b\)?")
+
+
+def _num(text: str):
+    t = (text or "").replace(",", "").replace("%", "").strip()
+    if not _NUM_RE.match((text or "").replace("%", "").strip()):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def pdf_layout_lines(path: str) -> list[dict]:
+    """Every word on every page, grouped into visual lines (top-to-bottom, left-to-right)."""
+    import pymupdf
+    doc = pymupdf.open(path)
+    buckets: dict[tuple, list] = {}
+    for pno, page in enumerate(doc):
+        for x0, y0, x1, y1, text, *_ in page.get_text("words"):
+            if not text.strip():
+                continue
+            buckets.setdefault((pno, round(y0 / 3.0)), []).append(
+                {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "text": text.strip()})
+    lines = []
+    for (pno, _k), ws in buckets.items():
+        ws.sort(key=lambda w: w["x0"])
+        lines.append({"page": pno, "y": min(w["y0"] for w in ws), "words": ws})
+    lines.sort(key=lambda l: (l["page"], l["y"]))
+    return lines
+
+
+def _header_columns(line: dict) -> dict:
+    """Map the printed column headers of one line to their x-centres."""
+    cols = {}
+    for w in line["words"]:
+        key = re.sub(r"[^a-z.]", "", w["text"].lower())
+        for label, aliases in HEADER_ALIASES.items():
+            if key in aliases and label not in cols:
+                cols[label] = (w["x0"] + w["x1"]) / 2.0
+    return cols
+
+
+def _looks_like_header(cols: dict) -> bool:
+    has_qty = "qty" in cols or "rate" in cols
+    return has_qty and "desc" in cols and ({"rate", "amount"} & set(cols))
+
+
+def _col_of(word: dict, cols: dict, labels: tuple[str, ...], tol: float = 26.0):
+    """Which of `labels` owns this word, judged by distance to that header's centre."""
+    best, best_d = None, 1e9
+    cen = (word["x0"] + word["x1"]) / 2.0
+    for lab in labels:
+        if lab not in cols:
+            continue
+        d = abs(cen - cols[lab])
+        if d < best_d:
+            best, best_d = lab, d
+    return best if best_d <= tol else None
+
+
+def parse_pdf_rows(path: str) -> dict:
+    """Read an estimate/abstract PDF as a printed table.
+
+    Returns {"rows": [...], "tables": n, "notes": [...]} where each row carries the
+    item code taken from the description block plus quantity / unit / rate / amount
+    read from their own columns and cross-checked (qty x rate == amount)."""
+    lines = pdf_layout_lines(path)
+    if not lines:
+        return {"rows": [], "tables": 0, "notes": ["no text layer"]}
+
+    header_idx, cols, tables = None, {}, 0
+    for i, ln in enumerate(lines):
+        c = _header_columns(ln)
+        if _looks_like_header(c):
+            header_idx, cols, tables = i, c, tables + 1
+            break
+    if header_idx is None:
+        return {"rows": [], "tables": 0, "notes": ["no Sr.No / Quantity / Rate column header found"]}
+
+    # start of the next section (any later header line) — rows never cross it
+    section_ends = [i for i, ln in enumerate(lines) if i > header_idx and _looks_like_header(_header_columns(ln))]
+    section_end = section_ends[0] if section_ends else len(lines)
+
+    rows: list[dict] = []
+    notes: list[str] = []
+    i = header_idx + 1
+    while i < section_end:
+        ln = lines[i]
+        nums = [(w, _num(w["text"])) for w in ln["words"]]
+        nums = [(w, v) for w, v in nums if v is not None]
+        qty_word = next((w for w, v in nums if _col_of(w, cols, ("qty",)) == "qty"
+                         and w["text"].strip().rstrip(".").isdigit() is False), None)
+        rate_word = next((w for w, v in nums if _col_of(w, cols, ("rate",)) == "rate"), None)
+        amt_word = next((w for w, v in nums if _col_of(w, cols, ("amount",)) == "amount"), None)
+        unit_word = next((w for w in ln["words"] if _col_of(w, cols, ("unit",)) == "unit"
+                          and _num(w["text"]) is None), None)
+        sr_word = next((w for w, v in nums if _col_of(w, cols, ("sr",)) == "sr"), None)
+
+        if qty_word is None or (rate_word is None and amt_word is None):
+            i += 1
+            continue
+
+        # description: this line's remaining words + every following line up to the next row
+        j = i + 1
+        desc_parts = [w["text"] for w in ln["words"]
+                      if w is not qty_word and w is not rate_word and w is not amt_word
+                      and w is not unit_word and w is not sr_word and _num(w["text"]) is None]
+        while j < section_end:
+            nxt = lines[j]
+            nxt_nums = [(w, _num(w["text"])) for w in nxt["words"]]
+            has_qty = any(_col_of(w, cols, ("qty",)) == "qty" for w, v in nxt_nums)
+            has_money = any(_col_of(w, cols, ("rate", "amount")) in ("rate", "amount") for w, v in nxt_nums)
+            if has_qty and has_money:
+                break                                   # next item row starts here
+            for w, v in nxt_nums:
+                if _col_of(w, cols, ("rate", "amount", "qty", "sr")) is None:
+                    desc_parts.append(w["text"])
+            j += 1
+        desc = " ".join(desc_parts)
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        qty = _num(qty_word["text"])
+        rate = _num(rate_word["text"]) if rate_word else None
+        amount = _num(amt_word["text"]) if amt_word else None
+        unit_hint = unit_word["text"] if unit_word else None
+        sr = _num(sr_word["text"]) if sr_word else None
+
+        confidence, note = 0.9, ""
+        if qty is not None and rate not in (None, 0) and amount is not None:
+            if abs(qty * rate - amount) <= max(1.0, 0.01 * abs(amount)):
+                confidence = 0.97
+                note = f"amount cross-checked: {_fmt(qty)} x {_fmt(rate)} = {_fmt(amount)}"
+            elif amount and abs(rate * qty - amount / 100.0) <= max(1.0, 0.02 * abs(amount)):
+                note = "printed amount looks like a rate-analysis value - quantity/rate columns verified by position"
+                confidence = 0.8
+            else:
+                confidence = 0.6
+                note = (f"quantity x rate ({_fmt(qty)} x {_fmt(rate)}) does not reproduce the printed "
+                        f"amount ({_fmt(amount)}) - verify on site")
+        elif qty is None:
+            confidence, note = 0.0, "no quantity in the Quantity column for this row"
+
+        code_match = _CODE_IN_TEXT_RE.search(desc)
+        code = normalise_code(code_match.group(1).replace(" ", "")) if code_match else None
+
+        rows.append({
+            "item_code": code,
+            "printed_code": code_match.group(0).strip("() ") if code_match else None,
+            "ocr_positions": [], "ocr_repaired": False,
+            "pdf_qty": qty, "pdf_rate": rate, "pdf_amount": amount,
+            "unit_hint": unit_hint, "sr_no": sr,
+            "confidence": round(confidence, 3),
+            "method": "pdf-column-table" if code else "pdf-column-table-nocode",
+            "line_no": i + 1,
+            "raw_line": (desc or "")[:400],
+            "note": note,
+        })
+        i = j
+
+    if not rows:
+        notes.append("no item rows matched the column layout")
+    return {"rows": rows, "tables": tables, "notes": notes}
+
+
+def _fmt(v) -> str:
+    return ("%g" % v) if isinstance(v, (int, float)) else str(v)
+
+
+def parse_estimate_pdf(path: str, master_index: dict[str, dict], *, merge: str = "max") -> dict | None:
+    """Column engine for PDFs.  Returns None when the document is not a printed table."""
+    try:
+        found = parse_pdf_rows(path)
+    except Exception as exc:                                    # pragma: no cover - defensive
+        return {"engine": "pdf-column-table", "items": [], "unknown": [], "duplicates": [],
+                "stats": {"anchors_found": 0, "unique_codes": 0, "matched": 0, "unknown": 0,
+                          "low_confidence": 0, "qty_column_band": None, "estimated_amount": 0.0,
+                          "duplicates": 0},
+                "ai_prompt": "", "error": str(exc), "notes": [str(exc)]}
+    rows = found.get("rows") or []
+    coded = [r for r in rows if r["item_code"]]
+    good = [r for r in rows if r["confidence"] >= 0.9]
+    if len(rows) < 2 or not coded or len(good) < 1:
+        return None
+    out = finish_parse(rows, master_index, merge=merge)
+    out["engine"] = "pdf-column-table"
+    out["notes"] = found.get("notes") or []
+    out["stats"]["tables_found"] = found.get("tables", 0)
+    out["stats"]["rows_read"] = len(rows)
+    out["stats"]["amount_cross_checked"] = sum(1 for r in rows if r["confidence"] >= 0.97)
+    out["stats"]["estimated_amount"] = round(
+        sum((r["pdf_qty"] or 0) * (r["pdf_rate"] or 0) for r in rows), 2)
+    return out

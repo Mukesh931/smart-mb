@@ -128,6 +128,31 @@ check("descriptions come from the Master CSR",
       all(len(r.get("description", "")) > 40 for r in parsed["rows"] if r["status"] == "matched"))
 check("duplicate anchor merged", stt.get("duplicates", 0) >= 1)
 
+print("\n[4b] Flow B2 - printed-table abstract (Work Abstract layout, code in brackets)")
+st, abs_parsed = upload(f"/api/projects/{PID}/parse-estimate",
+                        os.path.join(ROOT, "samples", "sample_work_abstract.pdf"),
+                        {"engine": "auto"}, token=ETOK)
+astats = abs_parsed.get("stats", {})
+check("column engine chosen for a printed table", abs_parsed.get("engine") == "pdf-column-table",
+      str(abs_parsed.get("engine")))
+check("every row read from its own column", astats.get("rows_read", 0) == 9, str(astats.get("rows_read")))
+ab_rows = {r["item_code"]: r for r in abs_parsed.get("rows", [])}
+check("code read from the bracketed anchor", "1-3-14" in ab_rows and "16-3-9" in ab_rows,
+      ", ".join(sorted(ab_rows))[:60])
+check("quantities taken from the Quantity column, not the rate/amount",
+      ab_rows.get("9-1-4", {}).get("tendered_qty") == 12 and ab_rows.get("1-3-14", {}).get("tendered_qty") == 55,
+      f"9-1-4={ab_rows.get('9-1-4', {}).get('tendered_qty')} 1-3-14={ab_rows.get('1-3-14', {}).get('tendered_qty')}")
+check("every amount cross-checked against qty x rate", astats.get("amount_cross_checked", 0) == 9,
+      str(astats.get("amount_cross_checked")))
+check("non-schedule row keeps the abstract's own rate and unit",
+      ab_rows.get("1-3-14", {}).get("rate") == 61 and ab_rows.get("1-3-14", {}).get("unit") == "m",
+      f"{ab_rows.get('1-3-14', {}).get('rate')} / {ab_rows.get('1-3-14', {}).get('unit')}")
+check("item absent from this version is matched from another CSR year when possible",
+      ab_rows.get("9-1-4", {}).get("status") in ("matched", "matched_other_version"),
+      str(ab_rows.get("9-1-4", {}).get("status")))
+check("the engineer is told why the rest did not match", bool(abs_parsed.get("hint")),
+      (abs_parsed.get("hint") or "")[:70])
+
 print("\n[5] Flow B - commit the reconciliation & build the checklist")
 rows = parsed["rows"]
 for r in rows:

@@ -87,7 +87,15 @@ def main_() -> None:
                   lambda m: m.group(1) + raw.replace("</", "<\\/") + m.group(2), html, flags=re.S)
     open(HTML, "w", encoding="utf-8").write(html)
     print(f"embedded snapshot: {len(raw)/1024:.1f} KiB -> {HTML}")
+    # the asset version stamp must move whenever the bundle does, or phones keep the
+    # old app.js — run the stamper as the last step of every build
+    try:
+        from . import stamp_assets
+    except ImportError:                                          # direct script use
+        import stamp_assets                                      # type: ignore
+    print(f"asset stamp: {stamp_assets.stamp()}")
 
 
 if __name__ == "__main__":
     main_()
+

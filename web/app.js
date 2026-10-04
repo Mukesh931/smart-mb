@@ -256,6 +256,7 @@ async function download(path, filename) {
 /* ------------------------------------------------------------ ui helpers */
 function toast(msg, kind = '', ms = 3600) {
   const wrap = document.getElementById('toasts');
+  while (wrap.children.length >= 3) wrap.firstElementChild.remove();   // never a wall of notices
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
   el.innerHTML = `${kind === 'bad' ? ICON.warn : kind === 'ok' ? ICON.check : kind === 'warn' ? ICON.warn : ICON.ruler}<div>${esc(msg)}</div>`;
@@ -325,6 +326,48 @@ async function render() {
     view.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>Could not load this screen.</b><br>${esc(err.message)}</div></div>`;
   }
   markNav();
+}
+
+/* The bundle a phone holds can be days old (and a field phone caches hard).  The server
+   publishes a build hash in /api/health; when it differs from the one stamped into this
+   page, reload instead of running stale screens. */
+const MY_BUILD = (document.querySelector('meta[name="smartmb-build"]') || {}).content || '';
+let _buildChecked = false;
+
+async function checkBuildAndStorage() {
+  if (_buildChecked || S.demo || !MY_BUILD) return;
+  _buildChecked = true;
+  try {
+    const h = await fetch('/api/health', { cache: 'no-store' }).then((r) => r.json());
+    if (h.build && h.build !== MY_BUILD) {
+      // a newer build is live: reload when nothing is at risk, otherwise offer a button
+      const busy = (S.outbox || []).length || document.querySelector('.sheet-bg') || document.querySelector('textarea:focus');
+      if (!busy && sessionStorage.getItem('smartmb_reloaded') !== h.build) {
+        sessionStorage.setItem('smartmb_reloaded', h.build);
+        toast('New version found — reloading', 'ok');
+        setTimeout(() => location.reload(), 600);
+      } else {
+        const bar = document.getElementById('outbox-bar');
+        if (bar) {
+          bar.style.display = '';
+          bar.classList.add('update');
+          bar.innerHTML = '<span class="dot warn"></span><div class="grow"><b>A newer version of Smart-MB is live.</b>'
+            + '<div class="small">Save what you are typing, then reload to get it.</div></div>'
+            + '<button class="btn sm" data-act="do-reload">Reload</button>';
+        }
+      }
+    }
+    S.storage = h.storage || 'persistent';
+    S.backupOn = !!(h.backup && h.backup.configured);
+    if (S.storage === 'ephemeral' && !S.backupOn) {
+      const key = 'smartmb_storage_warn';
+      const last = Number(localStorage.getItem(key) || 0);
+      if (Date.now() - last > 12 * 3600 * 1000) {
+        localStorage.setItem(key, String(Date.now()));
+        toast('This server has no permanent disk — a restart can erase works.', 'warn', 7000);
+      }
+    }
+  } catch (e) { /* offline: nothing to check */ }
 }
 
 function shell() {
@@ -645,7 +688,7 @@ function newProjectSheet() {
         <div><label class="f">Name of agency</label><input class="i" id="np-agency" placeholder="M/s ..."></div>
         <div><label class="f">Division</label><input class="i" id="np-div" value="${esc(u.division || '')}"></div>
         <div><label class="f">Circle</label><input class="i" id="np-circle" value="${esc(u.circle || '')}"></div>
-        <div><label class="f">Region</label>
+        <div><label class="f">Region <span class="muted tiny">(also picks the CSR version used for mapping)</span></label>
           <select class="i" id="np-region">${['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option ${(u.region || '') === r ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
         <div><label class="f">CSR financial year</label>
           <select class="i" id="np-fy"><option>2025-26</option><option selected>2024-25</option><option>2023-24</option></select></div>
@@ -692,9 +735,26 @@ Terrace / External | Corridor & External Area"></textarea></div>
 async function viewProject(view, id) {
   if (!id) { view.innerHTML = `<div class="empty">No project selected</div>`; return; }
   S.proj.id = id;
-  const [p, checklist, verify] = await Promise.all([
+  let p, checklist, verify;
+  try {
+    [p, checklist, verify] = await Promise.all([
     api(`/api/projects/${id}`), api(`/api/projects/${id}/checklist${S.proj.room ? '?room_id=' + S.proj.room : ''}`),
-    api(`/api/projects/${id}/verify`).catch(() => ({ totals: { pending: 0, cells: 0 }, docs: [], rooms: [] }))]);
+      api(`/api/projects/${id}/verify`).catch(() => ({ totals: { pending: 0, cells: 0 }, docs: [], rooms: [] }))]);
+  } catch (e) {
+    setTitle('Work not found', 'This record is no longer on the server');
+    view.innerHTML = `
+      <div class="card"><div class="hd">${ICON.warn}<h3>Work #${esc(String(id))} is not on this server</h3></div>
+        <div class="bd stack">
+          <div class="notice warn">${ICON.warn}<div>Either it was never created here, or the server was restarted on
+            hosting without a permanent disk and the database started empty. Works, measurements and photos created
+            before a restart are gone.</div></div>
+          <div class="row wrap-gap">
+            <button class="btn pri" data-act="goto-projects">Show the works that exist now</button>
+            <button class="btn" data-act="bk-hint">How do I stop losing data?</button>
+          </div>
+        </div></div>`;
+    return;
+  }
   S.proj.verifyData = verify;
   S.proj.data = p;
   const pr = p.project;
@@ -833,10 +893,24 @@ async function tabOverview(body, p, checklist) {
 
 async function tabImport(body, p) {
   const pr = p.project;
+  const hasEst = (p.items || 0) > 0;
+  let schedCount = 0;
+  try {
+    const wl = await api(`/api/projects/${pr.id}/verify`);
+    schedCount = ((wl.totals || {}).cells || 0);
+  } catch (e) { schedCount = 0; }
   body.innerHTML = `
+    <div class="card import-steps" style="margin-bottom:14px"><div class="bd row between wrap-gap">
+      <div class="small"><b>Two things to upload</b>
+        <div class="muted">① the estimate abstract · ② the descriptive schedule of the building</div></div>
+      <div class="row wrap-gap">
+        <button class="btn sm" data-act="jump-estimate">① Estimate abstract ${hasEst ? '<span class="badge ok">done</span>' : '<span class="badge warn">to do</span>'}</button>
+        <button class="btn sm pri" data-act="jump-schedule">② Descriptive schedule ${schedCount ? `<span class="badge ok">${schedCount} qty</span>` : '<span class="badge warn">to do</span>'}</button>
+      </div>
+    </div></div>
     <div class="grid g2" style="align-items:start">
-      <div class="card">
-        <div class="hd">${ICON.sparkle}<h3>Upload Technical Sanction estimate</h3></div>
+      <div class="card" id="card-estimate">
+        <div class="hd">${ICON.sparkle}<h3>Step 1 · Technical Sanction estimate (abstract)</h3></div>
         <div class="bd stack">
           <div class="notice info">${ICON.shield}<div>Descriptions and rates are taken from the <b>Master CSR ${esc(pr.csr_fy)} (${esc(pr.csr_region)})</b>. Only the item codes and quantities are read from your estimate — so a blurry or badly formatted PDF cannot corrupt the legal text.</div></div>
           <div><label class="f">Estimate file (PDF / Excel / CSV)</label><input class="i" type="file" id="est-file" accept=".pdf,.xlsx,.xlsm,.csv,.txt"></div>
@@ -853,7 +927,12 @@ async function tabImport(body, p) {
           <div id="parse-note"></div>
         </div>
       </div>
-      <div class="card">
+      <div class="card" id="card-schedule">
+        <div class="hd">${ICON.doc}<h3>Step 2 · Descriptive schedule (rooms, floors &amp; quantities)</h3></div>
+        <div class="bd stack" id="import-schedule"></div>
+      </div>
+      </div>
+      <div class="card" style="margin-top:14px">
         <div class="hd"><h3>How the Smart Map works</h3></div>
         <div class="bd small stack">
           <div><b>1 · Anchor-based extraction</b><div class="muted">The parser hunts for the item-number pattern <code class="kbd">^\\d+-\\d+-\\d+$</code> anywhere in the document, repairs OCR artefacts (O→0, l→1, S→5) and then looks for the quantity column.</div></div>
@@ -864,20 +943,11 @@ async function tabImport(body, p) {
           <button class="btn sm" data-act="show-prompt">${ICON.doc} View the parsing-engine prompt</button>
         </div>
       </div>
-    </div>
-    <div id="import-schedule" style="margin-top:16px"></div>
     <div id="import-result" style="margin-top:14px"></div>`;
 
-  const schedPanel = document.createElement('div');
-  schedPanel.innerHTML = `
-      <div class="row between" style="margin:2px 0 10px">
-        <div><b style="font-size:15px">Descriptive schedule</b>
-          <div class="small muted">The room / floor / location-wise quantities of the building — uploaded here or from the Site Verify tab.</div></div>
-      </div>
-      ${svImportHTML(pr, true)}`;
-  const schedHost = document.getElementById('import-schedule');   // container inside the tab body
-  if (schedHost) schedHost.innerHTML = schedPanel.innerHTML; else if (body.appendChild) body.appendChild(schedPanel);
-  svWireImport(schedHost || schedPanel, pr, () => {
+  const schedHost = document.getElementById('import-schedule');   // the Step 2 card body
+  if (schedHost) schedHost.innerHTML = svImportHTML(pr, true);
+  svWireImport(schedHost || body, pr, () => {
     S.verify.section = 'rooms'; S.proj.tab = 'verify'; render();
     toast('Schedule imported — opening Site Verify', 'ok');
   });
@@ -908,7 +978,7 @@ async function runParse({ file, text }) {
   try {
     let data;
     if (file) {
-      const fd = new FormData(); fd.append('file', file); fd.append('engine', 'anchor');
+      const fd = new FormData(); fd.append('file', file); fd.append('engine', 'auto');
       data = await api(`/api/projects/${S.proj.id}/parse-estimate`, { method: 'POST', form: fd });
     } else {
       data = await api(`/api/projects/${S.proj.id}/parse-text`, { method: 'POST', body: { text } });
@@ -917,7 +987,22 @@ async function runParse({ file, text }) {
     renderImportPreview(data);
     toast(`Parsed ${data.stats.unique_codes} item codes · ${data.stats.matched} matched`, 'ok');
   } catch (e) {
-    res.innerHTML = `<div class="notice bad">${ICON.warn}<div><b>Parsing failed.</b><br>${esc(e.message)}</div></div>`;
+    const gone = /not found/i.test(e.message || '');
+    res.innerHTML = gone ? `
+      <div class="card"><div class="hd">${ICON.warn}<h3>This work is no longer on the server</h3></div>
+        <div class="bd stack">
+          <div class="notice warn">${ICON.warn}<div>The upload was refused because the server has no record of
+            <b>#${S.proj.id}</b> any more. On hosting without a permanent disk, a restart or a redeploy starts the
+            database empty — every work created before that moment is gone, and any upload against it says
+            <i>Project not found</i>.</div></div>
+          <div class="row wrap-gap">
+            <button class="btn pri" data-act="recreate-project">Create this work again</button>
+            <button class="btn" data-act="goto-projects">See the works that exist now</button>
+          </div>
+          <div class="small muted">An administrator can also restore the last automatic backup from
+            <b>Admin Control → Data safety</b> and get the work back.</div>
+        </div></div>` : `
+      <div class="notice bad">${ICON.warn}<div><b>Parsing failed.</b><br>${esc(e.message)}</div></div>`;
   }
 }
 
@@ -925,21 +1010,26 @@ function renderImportPreview(data) {
   const res = document.getElementById('import-result');
   const rows = data.rows || [];
   const st = data.stats || {};
+  const pj = (S.proj.data && S.proj.data.project) || {};
+  const csrLabel = `${pj.csr_fy || ''} ${pj.csr_region || ''}`.trim();
   res.innerHTML = `
     <div class="card">
       <div class="hd">${ICON.check}<h3>Reconciliation preview</h3><div style="flex:1"></div>
         <span class="badge ok">${st.matched || 0} matched</span>
+        ${st.matched_other_version ? `<span class="badge warn">${st.matched_other_version} from another CSR year</span>` : ''}
         <span class="badge ${st.unknown ? 'ns' : ''}">${st.unknown || 0} non-schedule</span>
+        ${st.amount_cross_checked ? `<span class="badge ok">${st.amount_cross_checked} rows cross-checked</span>` : ''}
         ${st.low_confidence ? `<span class="badge warn">${st.low_confidence} low confidence</span>` : ''}
         ${st.duplicates ? `<span class="badge">${st.duplicates} duplicate anchor merged</span>` : ''}
       </div>
       <div class="bd">
         <div class="notice ${st.unknown ? 'warn' : 'ok'}">${ICON.sparkle}<div>
-          Found <b>${st.anchors_found}</b> anchors (${st.unique_codes} unique item codes) in <b>${esc(data.filename || 'input')}</b>.
-          <b>${st.matched}</b> matched the Master CSR database${st.unknown ? ` and <b>${st.unknown}</b> item(s) are <b>Unknown_Item</b> — give them a description and rate to add them as non-schedule items` : ' — nothing needs manual entry'}.
-          Estimated value at CSR rates: <b>₹ ${inr(st.estimated_amount)}</b>.
+          Found <b>${st.unique_codes || st.anchors_found}</b> item row(s) in <b>${esc(data.filename || 'input')}</b>.
+          <b>${st.matched}</b> matched the Master CSR database${st.matched_other_version ? ` (${st.matched_other_version} of them from another CSR year — confirm the rate)` : ''}${st.unknown ? `, and <b>${st.unknown}</b> item code(s) are <b>not in the Master CSR ${esc(csrLabel)}</b> — their description, unit and rate are taken from your abstract so they can still be billed as non-schedule items` : ' — nothing needs manual entry'}.
+          Estimated value: <b>₹ ${inr(st.estimated_amount)}</b>.
           <br><span class="tiny">${esc(data.engine_note || '')}</span>
         </div></div>
+        ${data.hint ? `<div class="notice info" style="margin-top:8px">${ICON.shield}<div>${esc(data.hint)}</div></div>` : ''}
         <div class="row" style="margin:10px 0">
           <button class="btn pri" data-act="confirm-import">${ICON.check} Confirm &amp; generate measurement checklist</button>
           <button class="btn" data-act="toggle-all-import">Select / deselect all</button>
@@ -1321,11 +1411,58 @@ async function viewAdmin(view) {
         <div class="foot">${st.photo_count} site photos</div></div>
     </div>
     <div class="tabs" style="margin-bottom:14px">
-      ${[['master', 'Master CSR versions'], ['users', 'Users & roles'], ['audit', 'Audit trail'], ['jobs', 'Parsing jobs']]
+      ${[['master', 'Master CSR versions'], ['users', 'Users & roles'], ['audit', 'Audit trail'], ['jobs', 'Parsing jobs'], ['data', 'Data safety']]
       .map(([k, l]) => `<button data-act="atab" data-t="${k}" class="${S.adminTab === k ? 'on' : ''}">${l}</button>`).join('')}
     </div>
     <div id="adminbody"></div>`;
   const b = document.getElementById('adminbody');
+  if (S.adminTab === 'data') {
+    let bk = { configured: false };
+    try { bk = await api('/api/admin/backup'); } catch (e) { bk = { configured: false, error: e.message }; }
+    const when = (v) => (v ? new Date(v).toLocaleString() : 'never');
+    b.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <div class="hd">${ICON.shield}<h3>Is this server's storage permanent?</h3>
+          <div style="flex:1"></div>
+          <span class="badge ${bk.storage === 'persistent' ? 'ok' : 'warn'}">${bk.storage === 'persistent' ? 'persistent disk attached' : 'no persistent disk'}</span></div>
+        <div class="bd stack">
+          ${bk.storage === 'persistent'
+    ? `<div class="notice ok">${ICON.check}<div>This service has a mounted disk, so works, measurements and photos survive restarts.</div></div>`
+    : `<div class="notice warn">${ICON.warn}<div><b>A restart can erase every work on this server.</b>
+              Free/plain container hosting keeps the database in the container, so a redeploy, a crash or an idle
+              spin-down starts from an empty database — that is how a work "disappears" and an upload then says
+              <i>Project not found</i>. Keep the backup below switched on, or attach a persistent disk.</div></div>`}
+          <div class="stat-line"><span>Data directory</span><span class="small">${esc(bk.data_dir || '')}</span></div>
+          <div class="stat-line"><span>Database size</span><span>${inr(bk.db_bytes || 0, 0)} bytes</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd">${ICON.up}<h3>Backups &amp; restore</h3><div style="flex:1"></div>
+          <span class="badge ${bk.configured ? 'ok' : ''}">${bk.configured ? 'automatic backup on' : 'automatic backup off'}</span></div>
+        <div class="bd stack">
+          ${bk.configured
+    ? `<div class="notice ok">${ICON.check}<div>A copy of the database, uploaded estimates and site photos is pushed to
+                <b>${esc(bk.repo)}</b> at most every ${bk.interval}s while people are working, and is put back automatically
+                when the server comes up empty.</div></div>`
+    : `<div class="notice info">${ICON.shield}<div>Automatic backup is off. Set <code class="kbd">SMARTMB_BACKUP_REPO</code> and
+                <code class="kbd">SMARTMB_BACKUP_TOKEN</code> (a fine-grained token with contents:write on a private repo) and
+                the platform keeps itself safe — or use the buttons below to keep a copy by hand.</div></div>`}
+          <div class="stat-line"><span>Last backup pushed</span><span>${when(bk.last_push)} ${bk.last_size ? '· ' + inr(bk.last_size, 0) + ' bytes' : ''}</span></div>
+          <div class="stat-line"><span>Last restore</span><span>${when(bk.last_restore)}</span></div>
+          ${bk.last_error ? `<div class="notice bad">${ICON.warn}<div>${esc(bk.last_error)}</div></div>` : ''}
+          <div class="row wrap-gap">
+            <button class="btn pri" data-act="bk-now">Back up now</button>
+            <button class="btn" data-act="bk-download">Download a copy</button>
+            <button class="btn" data-act="bk-restore-repo" ${bk.configured ? '' : 'disabled'}>Restore latest from backup</button>
+          </div>
+          <div class="hr"></div>
+          <label class="f">Restore from a snapshot file (.tar.gz)</label>
+          <input class="i" type="file" id="bk-file" accept=".gz,.tgz,application/gzip">
+          <button class="btn" data-act="bk-restore-file">Restore this file</button>
+        </div>
+      </div>`;
+    return;
+  }
   if (S.adminTab === 'master') {
     b.innerHTML = `
       <div class="card">
@@ -1417,6 +1554,65 @@ document.addEventListener('click', async (e) => {
 
   if (act === 'close-sheet') { closeSheet(); return; }
   if (act === 'outbox-sync') { syncNow(); return; }
+  if (act === 'bk-now') {
+    const btn = t; btn.disabled = true; btn.textContent = 'Backing up…';
+    try { const r = await api('/api/admin/backup/now', { method: 'POST' }); toast(`Backup pushed (${inr(r.bytes || 0, 0)} bytes)`, 'ok'); }
+    catch (e) { toast(e.message, 'bad'); }
+    btn.disabled = false; btn.textContent = 'Back up now';
+    render(); return;
+  }
+  if (act === 'bk-download') {
+    try { await download('/api/admin/backup/download', 'smart-mb-data.tar.gz'); }
+    catch (e) { toast('Download failed — ' + e.message, 'bad'); }
+    return;
+  }
+  if (act === 'bk-restore-repo') {
+    if (!confirm('Replace the data on this server with the latest backup?')) return;
+    const btn = t; btn.disabled = true; btn.textContent = 'Restoring…';
+    try { const r = await api('/api/admin/backup/restore', { method: 'POST', form: (() => { const f = new FormData(); f.append('source', 'repo'); return f; })() });
+      toast(`Restored ${r.db ? 'the database' : 'files'} — reloading`, 'ok'); setTimeout(() => location.reload(), 1200); }
+    catch (e) { toast(e.message, 'bad'); btn.disabled = false; btn.textContent = 'Restore latest from backup'; }
+    return;
+  }
+  if (act === 'bk-restore-file') {
+    const f = document.getElementById('bk-file');
+    if (!f || !f.files[0]) { toast('Choose a .tar.gz snapshot first', 'bad'); return; }
+    if (!confirm('Replace the data on this server with this snapshot?')) return;
+    const fd = new FormData(); fd.append('file', f.files[0]); fd.append('source', 'file');
+    try { await api('/api/admin/backup/restore', { method: 'POST', form: fd }); toast('Restored — reloading', 'ok'); setTimeout(() => location.reload(), 1200); }
+    catch (e) { toast(e.message, 'bad'); }
+    return;
+  }
+  if (act === 'jump-estimate') { (document.getElementById('card-estimate') || document.body).scrollIntoView({ block: 'start' }); const f = document.getElementById('est-file'); if (f) f.focus(); return; }
+  if (act === 'jump-schedule') {
+    const pr = S.proj.data && S.proj.data.project;
+    const narrow = window.matchMedia('(max-width: 760px)').matches;
+    if (narrow && pr) {
+      /* on a phone, bring the uploader to the engineer instead of making them scroll */
+      sheet({ title: 'Descriptive schedule', subtitle: 'Upload the PDF/Excel, paste the table, or load the sample',
+        body: svImportHTML(pr, true), body_id: 'sv-sheet-body', sticky: true,
+        onOpen: (el) => {
+          const host = el.querySelector('#sv-sheet-body');
+          svWireImport(host, pr, () => { closeSheet(); S.verify.section = 'rooms'; S.proj.tab = 'verify'; render(); });
+        } });
+      return;
+    }
+    const c = document.getElementById('card-schedule');
+    if (c) c.scrollIntoView({ block: 'start' });
+    const f = document.getElementById('sv-file'); if (f) f.focus();
+    return;
+  }
+  if (act === 'goto-projects') { location.hash = '#/projects'; render(); return; }
+  if (act === 'bk-hint') {
+    toast('Ask the admin to open Admin Control → Data safety: switch on automatic backup, or attach a persistent disk.', 'warn', 9000);
+    return;
+  }
+  if (act === 'recreate-project') {
+    S.newProjectPrefill = (S.proj.data && S.proj.data.project) ? S.proj.data.project : null;
+    location.hash = '#/projects'; render();
+    setTimeout(() => document.querySelector('[data-act="new-project"]')?.click(), 250);
+    return;
+  }
   if (act === 'goto-schedule') {
     const pr = S.proj && S.proj.project;
     if (S.proj) S.proj.tab = 'import';
@@ -1700,6 +1896,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('hashchange', () => { if (S.token || S.demo) render(); else renderLogin(); });
+window.addEventListener('load', () => setTimeout(checkBuildAndStorage, 800));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkBuildAndStorage(); });
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-act="do-reload"]')) location.reload();
+});
 window.addEventListener('online', () => { paintOutboxBadge(); if (S.outbox.length) outboxFlush(); });
 window.addEventListener('offline', () => paintOutboxBadge());
 setInterval(() => { if (S.outbox.length && isOnline()) outboxFlush(); }, 30000);

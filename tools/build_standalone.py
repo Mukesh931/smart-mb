@@ -7,7 +7,8 @@ moment it is opened from the FastAPI server (same origin as the API).
     python3 -m tools.build_standalone
 """
 from __future__ import annotations
-import os, re
+import os
+import re
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(BASE, "web")
@@ -19,12 +20,15 @@ def build() -> str:
     css = open(os.path.join(WEB, "style.css"), encoding="utf-8").read()
     js = open(os.path.join(WEB, "app.js"), encoding="utf-8").read()
 
-    html = html.replace('<link rel="stylesheet" href="style.css">', f"<style>\n{css}\n</style>")
-    html = html.replace('<script src="app.js"></script>', f"<script>\n{js}\n</script>")
+    # the stamp tool adds ?v=<hash> to both references — accept either form
+    html = re.sub(r'<link rel="stylesheet" href="style\.css(\?v=[0-9a-f]+)?">',
+                  lambda m: f"<style>\n{css}\n</style>", html)
+    html = re.sub(r'<script src="app\.js(\?v=[0-9a-f]+)?"></script>',
+                  lambda m: f"<script>\n{js}\n</script>", html)
     html = html.replace('<link rel="manifest" href="manifest.json">',
                         '<!-- manifest omitted in the single-file build -->')
     html = html.replace("<title>Smart-MB", "<title>Smart-MB (standalone build)")
-    assert "style.css" not in html and "app.js" not in html, "external references remain"
+    assert 'href="style.css' not in html and 'src="app.js' not in html, "external references remain"
     open(OUT, "w", encoding="utf-8").write(html)
     return OUT
 

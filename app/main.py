@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -30,7 +31,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth, db, parsing, reports, schedule as sch, schedule_store, seed
-from .db import PHOTO_DIR, SAMPLE_DIR, UPLOAD_DIR, audit, ex, json_load, now_iso, q, q1, rows_to_dicts
+from . import backup
+from .db import (DATA_DIR, DB_PATH, PHOTO_DIR, SAMPLE_DIR, UPLOAD_DIR, audit, ex, json_load,
+                 now_iso, q, q1, rows_to_dicts)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
@@ -45,7 +48,25 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
+    # A container that came up empty (free-plan restart / redeploy) pulls the last
+    # snapshot back before the database is created, so a work does not simply vanish.
+    restored = backup.restore_if_empty()
+    if restored:
+        print(f"[backup] restored {restored} from {restored.get('source')}", flush=True)
     seed.ensure_seed()
+    backup.start_background()
+
+
+@app.middleware("http")
+async def _track_writes(request, call_next):
+    """Every write marks the data as dirty; the background thread ships a snapshot."""
+    response = await call_next(request)
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400 \
+            and request.url.path.startswith("/api/") and request.url.path != "/api/auth/login":
+        backup.mark_dirty()
+    if request.url.path in ("/", "/index.html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 # --------------------------------------------------------------- helpers / auth
@@ -153,6 +174,45 @@ def master_index(fy: str, region: str) -> dict[str, dict]:
         "SELECT id, item_code, description, short_desc, unit, rate, category, section, spec_no, chapter, tags"
         " FROM master_items WHERE fy = ? AND region = ? AND is_active = 1", (fy, region)))
     return parsing.build_master_index(rows)
+
+
+def fy_of(master_row: dict) -> str:
+    return master_row.get("fy") or ""
+
+
+WEB_DIR = os.path.join(BASE_DIR, "web")
+
+
+_build_cache: dict = {"key": None, "value": "dev"}
+
+
+def _web_build() -> str:
+    """Content hash of the shipped bundle; the running app compares it with its own
+    <meta name="smartmb-build"> and refreshes itself when they differ.  Recomputed when
+    the files change (mtime+size), so an edited or redeployed bundle is never stale."""
+    try:
+        from tools import stamp_assets                     # same formula as the build step
+        key = []
+        for name in ("style.css", "app.js"):
+            st = os.stat(os.path.join(WEB_DIR, name))
+            key.append((st.st_mtime_ns, st.st_size))
+        key = tuple(key)
+        if _build_cache["key"] != key:
+            _build_cache.update(key=key, value=stamp_assets.build_id(__import__("pathlib").Path(WEB_DIR)))
+        return _build_cache["value"]
+    except OSError:
+        return "dev"
+
+
+BUILD = _web_build()
+
+
+ENGINE_NOTES = {
+    "pdf-column-table": ("Printed-table layout detected: quantity, unit, rate and amount were read from their own "
+                         "columns and each row's amount was cross-checked against quantity x rate."),
+    "anchor-regex-v1": ("Text-layer layout: item codes were located by the anchor pattern and the quantity column "
+                        "was inferred from the surrounding numbers."),
+}
 
 
 # ===================================================================== AUTH
@@ -674,10 +734,65 @@ def delete_project_item(iid: int, user: dict = Depends(current_user)):
 
 
 # --------------------------------------------------- SMART IMPORT (Flow B)
-def _run_parse(text: str, fy: str, region: str, filename: str, engine: str) -> dict:
+def master_index_fallback(fy: str, region: str) -> dict[str, dict]:
+    """Codes this work's CSR version does not carry, looked up in the other active
+    versions (same region first).  Real abstracts quote codes from a neighbouring
+    CSR year, and a rate in the hand beats a manual rate entry."""
+    rows = rows_to_dicts(q(
+        "SELECT id, item_code, description, short_desc, unit, rate, category, section, spec_no,"
+        " chapter, tags, fy, region FROM master_items WHERE is_active = 1 AND NOT (fy = ? AND region = ?)"
+        " ORDER BY CASE WHEN region = ? THEN 0 ELSE 1 END, fy DESC", (fy, region, region)))
+    idx: dict[str, dict] = {}
+    for r in rows:
+        idx.setdefault(r["item_code"], r)
+    return idx
+
+
+def _run_parse(text: str, fy: str, region: str, filename: str, engine: str, path: str = "") -> dict:
     idx = master_index(fy, region)
-    result = parsing.parse_estimate_text(text, idx)
+    result = None
+    if engine in ("auto", "table") and path.lower().endswith(".pdf"):
+        result = parsing.parse_estimate_pdf(path, idx)
+    if result is None:
+        result = parsing.parse_estimate_text(text, idx)
     result["master_index_size"] = len(idx)
+
+    # codes missing from this work's CSR version: try the other versions before
+    # declaring them non-schedule, and say exactly where the match came from
+    if result.get("unknown"):
+        fb = master_index_fallback(fy, region)
+        kept = []
+        for r in result["unknown"]:
+            m = fb.get(r["item_code"])
+            if not m:
+                kept.append(r)
+                continue
+            r = dict(r)
+            r["status"] = "matched_other_version"
+            r["master"] = m
+            r["flags"] = (r.get("flags") or []) + [
+                f"Not in CSR {fy} {region} - matched against CSR {m.get('fy')} {m.get('region')}: "
+                f"{m['item_code']} {m.get('unit')} @ {m.get('rate')}. Confirm this rate applies to this work."]
+            result["items"].append(r)
+        result["unknown"] = kept
+        result["items"].sort(key=lambda r: r.get("line_no") or 0)
+        st = result["stats"]
+        st["matched"] = len(result["items"])
+        st["unknown"] = len(result["unknown"])
+        st["matched_other_version"] = sum(1 for r in result["items"] if r.get("status") == "matched_other_version")
+        st["low_confidence"] = sum(1 for r in result["items"] if r["confidence"] < 0.7)
+        st["estimated_amount"] = round(sum((r["master"]["rate"] or 0) * (r["pdf_qty"] or 0)
+                                           for r in result["items"]), 2)
+    total = max(1, result["stats"].get("unique_codes") or 1)
+    unknown = result["stats"].get("unknown") or 0
+    result["stats"]["unknown_pct"] = round(100.0 * unknown / total, 1)
+    if unknown and result["stats"].get("matched"):
+        result["hint"] = (f"{unknown} of {total} item codes are not in the Master CSR {fy} {region} yet."
+                          " If the official CSR file has them, upload it under Admin -> Master CSR and re-parse;"
+                          " otherwise they will be imported as non-schedule items with a manual rate.")
+    elif unknown:
+        result["hint"] = (f"None of the {total} item codes are in the Master CSR {fy} {region}."
+                          " Upload the official CSR file for this year under Admin -> Master CSR and re-parse.")
     return result
 
 
@@ -687,9 +802,11 @@ def _parse_payload(pid: int, result: dict) -> dict:
     for r in result["items"]:
         m = r["master"]
         rows.append({
-            "include": True, "status": "matched", "printed_code": r["printed_code"],
+            "include": True, "status": r.get("status") or "matched", "printed_code": r["printed_code"],
             "item_code": r["item_code"], "pdf_qty": r["pdf_qty"] or 0, "unit": m["unit"],
             "description": m["description"], "short_desc": m.get("short_desc"),
+            "matched_from": (f"CSR {m.get('fy')} {m.get('region')}" if r.get("status") == "matched_other_version"
+                             else f"CSR {fy_of(m)} {m.get('region') or ''}".strip()),
             "rate": m["rate"], "master_item_id": m["id"], "confidence": r["confidence"],
             "method": r["method"], "flags": r["flags"], "raw_line": r["raw_line"], "line_no": r["line_no"],
             "is_non_schedule": False, "tendered_qty": r["pdf_qty"] or 0,
@@ -699,17 +816,20 @@ def _parse_payload(pid: int, result: dict) -> dict:
             "include": True, "status": "unknown_item", "printed_code": r["printed_code"],
             "item_code": r["printed_code"], "pdf_qty": r["pdf_qty"] or 0, "unit": r.get("unit_hint") or "Each",
             "description": (r["raw_line"][:180] or "NON-SCHEDULE ITEM - description required"),
-            "short_desc": None, "rate": 0, "master_item_id": None, "confidence": r["confidence"],
+            "short_desc": None, "rate": r.get("pdf_rate") or 0, "master_item_id": None,
+            "pdf_rate": r.get("pdf_rate"), "pdf_amount": r.get("pdf_amount"),
+            "confidence": r["confidence"],
             "method": r["method"], "flags": r["flags"] or ["Not found in Master CSR - manual rate/description required"],
             "raw_line": r["raw_line"], "line_no": r["line_no"], "is_non_schedule": True,
             "tendered_qty": r["pdf_qty"] or 0,
         })
     return {"rows": rows, "stats": result["stats"], "text_excerpt": None, "ai_prompt": result["ai_prompt"],
-            "engine": result["engine"], "duplicates": result.get("duplicates", [])}
+            "engine": result["engine"], "duplicates": result.get("duplicates", []),
+            "hint": result.get("hint"), "notes": result.get("notes") or []}
 
 
 @app.post("/api/projects/{pid}/parse-estimate")
-async def parse_estimate(pid: int, file: UploadFile = File(...), engine: str = Form("anchor"),
+async def parse_estimate(pid: int, file: UploadFile = File(...), engine: str = Form("auto"),
                          user: dict = Depends(current_user)):
     """Upload the Technical Sanction Estimate (PDF/Excel/CSV)."""
     p = q1("SELECT * FROM projects WHERE id=?", (pid,))
@@ -727,14 +847,14 @@ async def parse_estimate(pid: int, file: UploadFile = File(...), engine: str = F
     text = doc["text"] or ""
     if doc.get("needs_ocr"):
         text = _apply_ocr_shim(text)
-    result = _run_parse(text, p["csr_fy"], p["csr_region"], safe, engine)
+    result = _run_parse(text, p["csr_fy"], p["csr_region"], safe, engine, path=path)
     payload = _parse_payload(pid, result)
     payload.update({
         "filename": safe, "file_type": doc["file_type"], "needs_ocr": doc.get("needs_ocr", False),
         "text_excerpt": text[:6000], "ranks": 0, "project_id": pid,
         "engine_note": ("Text layer is sparse - the file is likely a scan. OCR shim + OCR-repair on item codes "
                         "applied; verify quantities flagged low-confidence."
-                        if doc.get("needs_ocr") else "Digital text layer detected - layout column mapping used."),
+                        if doc.get("needs_ocr") else ENGINE_NOTES.get(result.get("engine"), "Digital text layer detected.")),
     })
     audit(user, "ESTIMATE_PARSED", "projects", pid,
           {"file": safe, "matched": payload["stats"]["matched"], "unknown": payload["stats"]["unknown"],
@@ -1413,8 +1533,57 @@ def dashboard(user: dict = Depends(current_user)):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "time": now_iso(), "items": q1("SELECT COUNT(*) AS c FROM master_items")["c"],
-            "projects": q1("SELECT COUNT(*) AS c FROM projects")["c"]}
+    n_projects = q1("SELECT COUNT(*) AS c FROM projects")["c"]
+    return {"ok": True, "time": now_iso(), "build": _web_build(),
+            "items": q1("SELECT COUNT(*) AS c FROM master_items")["c"],
+            "projects": n_projects,
+            "storage": "persistent" if os.environ.get("SMARTMB_PERSISTENT_DISK") == "1" else "ephemeral",
+            "backup": backup.status(enabled_only=True)}
+
+
+# ------------------------------------------------------------------ data safety
+@app.get("/api/admin/backup")
+def backup_status(user: dict = Depends(admin_only)):
+    st = backup.status()
+    st["storage"] = "persistent" if os.environ.get("SMARTMB_PERSISTENT_DISK") == "1" else "ephemeral"
+    st["data_dir"] = DATA_DIR
+    st["db_bytes"] = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    return st
+
+
+@app.post("/api/admin/backup/now")
+def backup_now(user: dict = Depends(admin_only)):
+    try:
+        out = backup.snapshot_now("admin")
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+    audit(user, "BACKUP_PUSHED", "backup", "", {"bytes": out.get("bytes")})
+    return {"ok": True, **out, **backup.status()}
+
+
+@app.get("/api/admin/backup/download")
+def backup_download(user: dict = Depends(admin_only)):
+    blob = backup.make_archive()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    return Response(blob, media_type="application/gzip",
+                    headers={"Content-Disposition": f'attachment; filename="smart-mb-data-{stamp}.tar.gz"'})
+
+
+@app.post("/api/admin/backup/restore")
+async def backup_restore(file: UploadFile | None = File(None), source: str = Form("file"),
+                         user: dict = Depends(admin_only)):
+    """Put a snapshot back: either the uploaded .tar.gz or the latest one in the repo."""
+    if source == "repo":
+        try:
+            info = backup.restore_latest()
+        except Exception as exc:
+            raise HTTPException(400, str(exc))
+    else:
+        if file is None:
+            raise HTTPException(400, "Attach the .tar.gz snapshot to restore")
+        info = backup.unpack_archive(await file.read())
+    audit(user, "BACKUP_RESTORED", "backup", "", info)
+    return {"ok": True, **info, "note": "Restart the service if the restored data does not appear immediately."}
 
 
 # ------------------------------------------------------------------ static app

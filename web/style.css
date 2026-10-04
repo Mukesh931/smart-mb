@@ -227,6 +227,11 @@ button, .btn, input, select, textarea, a, .card, .sched-step, section, h3 {
 @media (max-width: 900px) {
   #toasts { top: calc(10px + env(safe-area-inset-top, 0px)); bottom: auto; }
 }
+/* A sheet is full-screen on a phone: keep notices below its header so they can never
+   sit on the title or the close button. */
+@media (max-width: 900px) {
+  body:has(.sheet-bg) #toasts { top: auto; bottom: calc(120px + env(safe-area-inset-bottom, 0px)); }
+}
 @media (min-width: 901px) { #toasts { bottom: 24px; } }
 .toast { padding: 11px 13px; border-radius: 11px; box-shadow: var(--shadow-lg); font-size: 13.5px; background: #0f172a; color: #fff; display: flex; gap: 9px; align-items: flex-start; max-width: 100%; }
 .toast svg, .notice svg, .badge svg, .chip svg { width: 17px; height: 17px; flex: 0 0 17px; }
