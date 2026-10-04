@@ -28,6 +28,7 @@ import csv
 import io
 import os
 import re
+from functools import lru_cache
 import statistics
 from typing import Any, Iterable
 
@@ -74,7 +75,19 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip())
 
 
+@lru_cache(maxsize=20000)
+def _tokens_cached(text: str) -> frozenset[str]:
+    return frozenset(_tokenise(text))
+
+
 def _tokens(text: str) -> set[str]:
+    """Tokenising the same CSR description for every schedule column is the whole cost of
+    matching (55 columns x 2 319 master items); the result is cached, which is what makes
+    the reconciliation finish in seconds on a small instance instead of timing out."""
+    return set(_tokens_cached(text))
+
+
+def _tokenise(text: str) -> set[str]:
     t = _clean(text).lower()
     for k, v in SYNONYMS.items():
         t = t.replace(k, v)
@@ -115,9 +128,11 @@ def _idf(token_sets: list[set[str]]) -> dict[str, float]:
     return {t: math.log((n + 1) / (c + 0.5)) for t, c in df.items()}
 
 
-def coverage_score(label: str, hay: str, idf: dict[str, float], unit: str = "") -> float:
+def coverage_score(label: str, hay: str, idf: dict[str, float], unit: str = "",
+                   lt: set[str] | None = None, ht: set[str] | None = None) -> float:
     """How much of the schedule column label is accounted for by the item wording (0..1)."""
-    lt, ht = _tokens(label), _tokens(hay)
+    lt = _tokens(label) if lt is None else lt
+    ht = _tokens(hay) if ht is None else ht
     if not lt or not ht:
         return 0.0
     inter = lt & ht
@@ -145,6 +160,7 @@ _INTENT_PENALTY = [
      r"\bsupplied by department\b|departmentally supplied", 0.65),
     (r"\btesting and charging|\btesting,? only\b", 0.7),
 ]
+_INTENT_WORDS = re.compile(r"dismantl|remov|credit|rewind|repair|recess|departmentally")
 _INTENT_BONUS = [
     (r"^\s*supplying?\b", 1.06),
     (r"\bsupplying and (erecting|fixing|installing|laying)", 1.04),
@@ -646,17 +662,40 @@ def map_columns(columns: Iterable[dict], project_items: list[dict], master_items
     cands: list[tuple[str, dict, str]] = [("project_item", it, hay(it)) for it in project_items]
     cands += [("master_item", mi, hay(mi)) for mi in master_items]
     labels = [str(c.get("label") or "") for c in columns]
-    idf = _idf([_tokens(h) for _k, _o, h in cands] + [_tokens(l) for l in labels])
+
+    # Everything that only depends on the candidate is computed once, and an inverted index
+    # of token -> candidates keeps the scoring to the candidates that can plausibly match.
+    # Without it a 55-column schedule against the full printed CSR (2 319 items) is ~128k
+    # scorings and takes longer than a small instance's request budget - on live that
+    # surfaced as a 502 during import.
+    toks: list[set[str]] = [_tokens(h) for _k, _o, h in cands]
+    idf = _idf(toks + [_tokens(l) for l in labels])
+    neutral_intent = [intent_factor("", text) for _k, _o, text in cands]
+    index: dict[str, list[int]] = {}
+    for i, t in enumerate(toks):
+        for token in t:
+            index.setdefault(token, []).append(i)
 
     out = []
     for col in columns:
         label = col["label"]
         lt = _tokens(label)
+        # candidates sharing at least one word with the column label; a label made only of
+        # stop words falls back to the whole pool.
+        pool_idx = {i for token in lt for i in index.get(token, [])} if lt else set()
+        if not pool_idx:
+            pool_idx = set(range(len(cands)))
         scored = []
-        for kind, obj, text in cands:
-            score = coverage_score(label, text, idf, obj.get("unit") or "")
-            score = round(min(1.0, score * intent_factor(label, text)), 3)
-            ht = _tokens(text)
+        for i in sorted(pool_idx):
+            kind, obj, text = cands[i]
+            score = coverage_score(label, text, idf, obj.get("unit") or "", lt, toks[i])
+            factor = neutral_intent[i]
+            # intent rules look at the label too, but only a label that itself talks about
+            # dismantling / rewinding / recessing can lift one of those penalties
+            if _INTENT_WORDS.search(label.lower()):
+                factor = intent_factor(label, text)
+            score = round(min(1.0, score * factor), 3)
+            ht = toks[i]
             dice = (2 * len(lt & ht) / (len(lt) + len(ht))) if lt and ht else 0.0
             scored.append((score, round(dice, 4), 0 if kind == "project_item" else 1, kind, obj))
         # best wording coverage first, then the most *focused* candidate (a short exact
