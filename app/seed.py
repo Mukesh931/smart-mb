@@ -17,8 +17,11 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from . import auth, db
-from .db import audit, ex, now_iso, q, q1
+import json
+import os
+
+from . import auth, db, org
+from .db import SAMPLE_DIR, audit, ex, now_iso, q, q1
 
 FY_FACTOR = {"2022-23": 0.86, "2023-24": 0.93, "2024-25": 1.00, "2025-26": 1.04}
 REGION_FACTOR = {
@@ -487,10 +490,150 @@ def _demo_verify(pid: int, doc_id: int) -> None:
                 changed += 1
 
 
+def tags_for(description: str) -> list[str]:
+    """Keyword tags used by the Extra-Item search and the schedule matcher.
+
+    Kept text-only and deterministic (no model call): the printed descriptions are
+    regular enough that a keyword table is enough to make "Exhaust Fan" findable."""
+    import re as _re
+    rules = [
+        ("Fan", r"\bfan\b|exhaust|ceiling fan|pedestal|wall mounting fan"),
+        ("Earthing", r"earth|earthing|electrode|gi wire"),
+        ("Light Fitting", r"luminaire|lamp|lumens|light fitting|street light|batten|panel light|flood light"),
+        ("LED", r"\bLED\b"),
+        ("Conduit", r"conduit|casing|trunking"),
+        ("Wiring", r"\bwire\b|wiring|FRLSH|flexible cable"),
+        ("Cable", r"\bcable\b|XLPE|armoured"),
+        ("Switch/Socket", r"switch|socket|modular"),
+        ("DB", r"distribution board|\bDB\b|panel board"),
+        ("Panel", r"control panel|feeder pillar|\bMCC\b"),
+        ("Protection", r"\bMCB\b|\bMCCB\b|\bRCCB\b|\bRCBO\b|isolator|fuse|SPMCB|ELCB"),
+        ("Transformer", r"transformer"),
+        ("Motor", r"\bmotor\b|pump set|submersible"),
+        ("Generator", r"generator|DG set"),
+        ("Pole", r"\bpole\b|octagonal|swaged|mast"),
+        ("Street Light", r"street light|sodium"),
+        ("Fire", r"fire|sprinkler|hydrant|alarm"),
+        ("Water Pump", r"water pump|monoblock|submersible pump"),
+        ("Lift", r"\blift\b|elevator"),
+        ("Siren", r"siren"),
+        ("Testing", r"testing|commissioning|megger"),
+        ("Dismantling", r"dismantl|credit"),
+        ("Civil", r"excavation|trench|foundation|concrete|plaster"),
+    ]
+    d = description or ""
+    return [name for name, pat in rules if _re.search(pat, d, _re.I)]
+
+
+def seed_official_csr(snapshot: str | None = None) -> dict | None:
+    """Load the official CSR snapshot that ships in samples/ when that version is missing.
+
+    The printed CSR in samples/csr_2022-23_maharashtra.csv.gz is what the division actually
+    quotes from, so a fresh instance carries it from the first second — and gets it back
+    after a restart, without needing the admin to re-import anything.
+    """
+    import gzip
+    import csv as _csv
+    path = snapshot or os.environ.get("SMARTMB_CSR_SNAPSHOT") or os.path.join(
+        SAMPLE_DIR, "csr_2022-23_maharashtra.csv.gz")
+    if not os.path.exists(path):
+        return None
+    fy, region = "2022-23", "Maharashtra"
+    if q1("SELECT id FROM csr_versions WHERE fy=? AND region=?", (fy, region)):
+        return None
+    ts = now_iso()
+    rows, kept = [], 0
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        for r in _csv.DictReader(fh):
+            rows.append(r)
+    for r in rows:
+        desc = (r.get("description") or "").strip()
+        code = (r.get("item_code") or "").strip()
+        if not code or len(desc) < 8:
+            continue
+        ex("""INSERT OR REPLACE INTO master_items (fy, region, item_code, description, short_desc, unit, rate,
+                 material_rate, labour_rate, chapter, section, category, spec_no, tags, is_new, is_active,
+                 created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           (fy, region, code, desc, (desc[:117] + "…") if len(desc) > 120 else desc,
+            (r.get("unit") or "Each").strip() or "Each", float(r.get("rate") or 0), 0.0, 0.0,
+            int(r["chapter"]) if str(r.get("chapter") or "").isdigit() else None,
+            (r.get("section") or "").strip(), (r.get("category") or "").strip(),
+            (r.get("spec_no") or "").strip(), json.dumps(tags_for(desc)), 0, 1, ts, ts))
+        kept += 1
+    ex("""INSERT INTO csr_versions (fy, region, status, item_count, source_file, notes, uploaded_at)
+          VALUES (?,?,?,?,?,?,?)
+          ON CONFLICT(fy, region) DO UPDATE SET status='active', item_count=excluded.item_count,
+              source_file=excluded.source_file, notes=excluded.notes, uploaded_at=excluded.uploaded_at""",
+       (fy, region, "active", kept, os.path.basename(path),
+        "Official PWD Electrical CSR 2022-23 (printed PDF) - completed rate with 5% and 10% rate columns.", ts))
+    audit(None, "CSR_IMPORTED", "master_items", f"{fy} {region}",
+          {"items": kept, "source": os.path.basename(path)})
+    return {"fy": fy, "region": region, "items": kept}
+
+
+def seed_org_users() -> list[str]:
+    """The division's officers: one EE, one SDO, one officer per section.
+
+    Idempotent - matched by e-mail, so an admin can rename or re-post them freely.
+    """
+    people = [
+        ("Executive Engineer, PWD Electrical Division Dhule", "ee.dhule@pwd.maharashtra.gov.in",
+         "ee", org.DIVISION, "Executive Engineer", "Dhule"),
+        ("Sub Divisional Officer, PWD Electrical Sub Division Jalgaon", "sdo.jalgaon@pwd.maharashtra.gov.in",
+         "sdo", org.SUBDIVISION, "Deputy Engineer", "Jalgaon"),
+        ("Section Officer, Jalgaon-1", "je.jalgaon1@pwd.maharashtra.gov.in", "section", "Jalgaon-1",
+         "Junior Engineer", "Jalgaon"),
+        ("Section Officer, Jalgaon-2", "je.jalgaon2@pwd.maharashtra.gov.in", "section", "Jalgaon-2",
+         "Junior Engineer", "Jalgaon"),
+        ("Section Officer, Amalner", "je.amalner@pwd.maharashtra.gov.in", "section", "Amalner",
+         "Junior Engineer", "Amalner"),
+    ]
+    units = {u["name"]: dict(u) for u in q("SELECT * FROM org_units")}
+    made = []
+    for name, email, role, unit_name, designation, region in people:
+        row = q1("SELECT * FROM users WHERE lower(email)=lower(?)", (email,))
+        uid_unit = units.get(unit_name, {}).get("id")
+        if row:
+            if not row["org_unit_id"] and uid_unit:
+                ex("UPDATE users SET org_unit_id=?, role=CASE WHEN role='admin' THEN role ELSE ? END WHERE id=?",
+                   (uid_unit, role, row["id"]))
+            continue
+        uid = ex("""INSERT INTO users (name,email,password_hash,role,designation,division,region,phone,
+                     org_unit_id,section,is_active,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,1,?)""",
+                 (name, email, auth.hash_password("Engineer@123"), role, designation, org.DIVISION,
+                  region, "", uid_unit, unit_name if role == "section" else None, now_iso())).lastrowid
+        made.append(email)
+        if units.get(org.DIVISION):
+            ex("UPDATE users SET org_unit_id=COALESCE(org_unit_id,?) WHERE id=?", (units[org.DIVISION]["id"], uid))
+    return made
+
+
+def assign_org_defaults() -> dict:
+    """File anything created before the organisation model existed.
+
+    Users without a unit land on the division (they keep the wide view they had), and
+    projects without a unit are tagged with the Jalgaon sub-division so they appear in
+    the right lists instead of floating.
+    """
+    units = {u["name"]: dict(u) for u in q("SELECT * FROM org_units")}
+    div, sub = units.get(org.DIVISION), units.get(org.SUBDIVISION)
+    users_fixed = projects_fixed = 0
+    if div:
+        users_fixed = ex("UPDATE users SET org_unit_id=? WHERE org_unit_id IS NULL AND role!='admin'",
+                         (div["id"],)).rowcount
+        ex("UPDATE users SET org_unit_id=? WHERE org_unit_id IS NULL", (div["id"],))
+    if sub:
+        projects_fixed = ex("UPDATE projects SET org_unit_id=? WHERE org_unit_id IS NULL", (sub["id"],)).rowcount
+    return {"users": users_fixed, "projects": projects_fixed}
+
+
 def ensure_seed() -> None:
     db.init_db()
     if not q1("SELECT id FROM master_items LIMIT 1"):
         seed_master_csr()
+    seed_official_csr()
     if not q1("SELECT id FROM users LIMIT 1"):
         seed_users()
     if not q1("SELECT id FROM projects LIMIT 1"):
@@ -498,3 +641,6 @@ def ensure_seed() -> None:
         seed_demo_schedule()
     if q1("SELECT id FROM schedule_docs LIMIT 1") is None and q1("SELECT id FROM projects LIMIT 1"):
         seed_demo_schedule()
+    org.seed_org()
+    seed_org_users()
+    assign_org_defaults()

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import os
 import sys
 import urllib.error
@@ -88,7 +89,84 @@ st, r = call("/api/auth/login", "POST", {"email": "admin@pwd.maharashtra.gov.in"
 check("bad password rejected", st == 401)
 st, r = call("/api/csr/versions", token=ETOK)
 check("engineer cannot reseed master", call("/api/admin/reseed", "POST", token=ETOK)[0] == 403)
-check("CSR versions listed", st == 200 and len(r["versions"]) == 14, f"{len(r.get('versions', []))} versions")
+check("CSR versions listed", st == 200 and len(r["versions"]) >= 14, f"{len(r.get('versions', []))} versions")
+START_ITEMS = call("/api/health")[1]["items"]
+
+print("\n[1b] the official PWD CSR 2022-23 (printed PDF) is in the Master Database")
+st, r = call("/api/csr/versions", token=ETOK)
+official = [v for v in r.get("versions", []) if v["fy"] == "2022-23" and v["region"] == "Maharashtra"]
+check("the printed CSR ships with the app (2022-23 / Maharashtra)", bool(official) and official[0]["item_count"] >= 2300,
+      f"{official[0]['item_count'] if official else 0} items from {official[0]['source_file'] if official else '-'}")
+st, r = call("/api/csr/items?fy=2022-23&region=Maharashtra&q=1-1-1&limit=1", token=ETOK)
+c111 = (r.get("items") or [{}])[0]
+check("item 1-1-1 read from the printed book (m @ 197)", c111.get("unit") == "m" and abs((c111.get("rate") or 0) - 197) < 0.01,
+      f"{c111.get('item_code')} {c111.get('unit')} @ {c111.get('rate')}")
+st, r = call("/api/csr/items?fy=2022-23&region=Maharashtra&q=9-1-4&limit=1", token=ETOK)
+c914 = (r.get("items") or [{}])[0]
+check("1-3-14 / 9-1-4 carry the CSR's own completed rate", abs((c914.get("rate") or 0) - 1500) < 0.01,
+      f"9-1-4 @ {c914.get('rate')}")
+check("chapters and specification numbers survive the import",
+      str(c111.get("chapter")) == "1" and len(c111.get("section") or "") > 4,
+      f"ch{c111.get('chapter')} · {c111.get('section')}")
+st, r = call("/api/csr/suggest?q=exhaust+fan&fy=2022-23&region=Maharashtra", token=ETOK)
+hits = r.get("results", [])
+check("'Exhaust Fan' resolves to fan-supply items inside the real CSR",
+      bool(hits) and all(re.search(r"exhaust fan", x["description"], re.I) for x in hits[:3]),
+      ", ".join(f"{x['item_code']} Rs{x['rate']}" for x in hits[:3]))
+check("the search does not answer with a dismantling or painting row",
+      all(not re.search(r"dismantl|spray painting", x["description"][:40], re.I) for x in hits[:3]),
+      (hits[0]["description"][:60] if hits else ""))
+st, r = call("/api/csr/suggest?q=MCCB+100A&fy=2022-23&region=Maharashtra", token=ETOK)
+check("a purpose clause does not outrank the item itself",
+      bool(r.get("results")) and "mccb" in r["results"][0]["description"][:60].lower(),
+      r["results"][0]["description"][:64] if r.get("results") else "")
+st, r = call("/api/csr/versions", token=ETOK)
+check("the rate-book versions are distinguishable by name",
+      len({v["fy"] for v in r["versions"]}) >= 2, f"{len({v['fy'] for v in r['versions']})} financial years")
+
+print("\n[1c] organisation - division, sub division and sections")
+st, og = call("/api/org", token=ATOK)
+names = {d["name"]: [s2["name"] for s2 in d["children"]] for d in og.get("tree", [])}
+div = "PWD Electrical Division Dhule"
+sub = "PWD Electrical Sub Division Jalgaon"
+check("division Dhule exists", div in names, ", ".join(names))
+check("sub division Jalgaon exists under it", sub in names.get(div, []), ", ".join(names.get(div, [])))
+sections = {x["name"] for d in og["tree"] for s2 in d["children"] for x in s2["children"]}
+check("its three sections are modelled", {"Jalgaon-1", "Jalgaon-2", "Amalner"} <= sections, ", ".join(sorted(sections)))
+check("roles follow the hierarchy", {"ee", "sdo", "section"} <= {r["id"] for r in og["roles"]},
+      ", ".join(r["id"] for r in og["roles"]))
+
+OFFICERS = {}
+for email, label in (("ee.dhule@pwd.maharashtra.gov.in", "EE"), ("sdo.jalgaon@pwd.maharashtra.gov.in", "SDO"),
+                     ("je.jalgaon1@pwd.maharashtra.gov.in", "JE-1"), ("je.jalgaon2@pwd.maharashtra.gov.in", "JE-2"),
+                     ("je.amalner@pwd.maharashtra.gov.in", "JE-Amalner")):
+    st, r = call("/api/auth/login", "POST", {"email": email, "password": "Engineer@123"})
+    OFFICERS[label] = r.get("token", "")
+check("every officer of the division can sign in", all(OFFICERS.values()), ", ".join(k for k, v in OFFICERS.items() if not v))
+
+st, ee_me = call("/api/auth/me", token=OFFICERS["EE"])
+st, sdo_me = call("/api/auth/me", token=OFFICERS["SDO"])
+check("an EE is scoped to the whole division", "Division Dhule" in (ee_me["user"].get("scope_label") or ""),
+      ee_me["user"].get("scope_label"))
+check("an SDO is scoped to the sub division", "Sub Division Jalgaon" in (sdo_me["user"].get("scope_label") or ""),
+      sdo_me["user"].get("scope_label"))
+
+org_projects = []
+for label, name in (("JE-1", "FAT org - Jalgaon-1 work"), ("JE-2", "FAT org - Jalgaon-2 work"),
+                    ("JE-Amalner", "FAT org - Amalner work")):
+    st, r = call("/api/projects", "POST", {"name": name, "csr_fy": "2022-23", "csr_region": "Maharashtra",
+                                           "region": "Jalgaon"}, token=OFFICERS[label])
+    org_projects.append(r.get("project_id"))
+check("each section officer can create their own work", all(org_projects), str(org_projects))
+
+seen = {}
+for label in ("JE-1", "JE-2", "JE-Amalner", "SDO", "EE"):
+    ids = {p["id"] for p in call("/api/projects", token=OFFICERS[label])[1].get("projects", [])}
+    seen[label] = {i for i in org_projects if i in ids}
+check("a section officer sees only their own section's work", seen["JE-1"] == {org_projects[0]} and seen["JE-2"] == {org_projects[1]},
+      f"JE-1 {sorted(seen['JE-1'])} · JE-2 {sorted(seen['JE-2'])}")
+check("the SDO sees all three sections", seen["SDO"] == set(org_projects), str(sorted(seen["SDO"])))
+check("the EE sees the whole division", seen["EE"] == set(org_projects), str(sorted(seen["EE"])))
 
 print("\n[2] master CSR browse & search")
 st, r = call("/api/csr/items?fy=2024-25&region=Nashik&limit=5&q=earthing", token=ETOK)
@@ -119,9 +197,13 @@ st, parsed = upload(f"/api/projects/{PID}/parse-estimate", os.path.join(ROOT, "s
 stt = parsed.get("stats", {})
 check("parse returns rows", st == 200 and len(parsed.get("rows", [])) > 10, f"{len(parsed.get('rows', []))} rows")
 check("anchors found", stt.get("anchors_found", 0) >= 19, str(stt.get("anchors_found")))
-check("matched against master", stt.get("matched", 0) == 18, str(stt.get("matched")))
-check("non-schedule flagged as Unknown_Item", stt.get("unknown") == 1,
-      (parsed.get("rows", [{}])[-1] or {}).get("item_code", ""))
+check("matched against master", stt.get("matched", 0) == 19, str(stt.get("matched")))
+check("a code missing from this version is matched from another CSR year, and said so",
+      all(r["status"] in ("matched", "matched_other_version") for r in parsed["rows"]) and
+      any(r["status"] == "matched_other_version" for r in parsed["rows"]),
+      ", ".join(sorted({r["status"] for r in parsed["rows"]})))
+check("the cross-version match carries a warning to confirm the rate",
+      any(r.get("flags") for r in parsed["rows"] if r["status"] == "matched_other_version"))
 check("OCR artefact cured (1-O-1 -> 1-1-1)",
       any(r["item_code"] == "1-1-1" and r["printed_code"] != "1-1-1" for r in parsed["rows"]))
 check("descriptions come from the Master CSR",
@@ -150,8 +232,47 @@ check("non-schedule row keeps the abstract's own rate and unit",
 check("item absent from this version is matched from another CSR year when possible",
       ab_rows.get("9-1-4", {}).get("status") in ("matched", "matched_other_version"),
       str(ab_rows.get("9-1-4", {}).get("status")))
-check("the engineer is told why the rest did not match", bool(abs_parsed.get("hint")),
-      (abs_parsed.get("hint") or "")[:70])
+check("the abstract's own total is reported as printed", (astats.get("estimated_amount") or 0) > 0,
+      f"Rs {astats.get('estimated_amount')}")
+check("and re-valued at the Master CSR rates", (astats.get("csr_amount") or 0) > 0,
+      f"Rs {astats.get('csr_amount')}")
+
+print("\n[4c] Flow B3 - the same printed abstract mapped against the real CSR 2022-23")
+st, r = call("/api/projects", "POST", {
+    "name": "FAT Test - street light work mapped to the official CSR", "scheme": "Test scheme",
+    "region": "Nashik", "csr_fy": "2022-23", "csr_region": "Maharashtra", "mb_no": "MB-CSR",
+    "rooms": [{"floor": "Ground Floor", "name": "Panel Room"}],
+}, token=ETOK)
+PID2 = r.get("project_id")
+st, csr_parsed = upload(f"/api/projects/{PID2}/parse-estimate",
+                        os.path.join(ROOT, "samples", "sample_work_abstract.pdf"),
+                        {"engine": "auto"}, token=ETOK)
+cstats = csr_parsed.get("stats", {})
+crows = {r["item_code"]: r for r in csr_parsed.get("rows", [])}
+check("every code in the abstract now resolves inside the printed CSR",
+      cstats.get("matched") == 9 and cstats.get("unknown") == 0,
+      f"{cstats.get('matched')} matched, {cstats.get('unknown')} outside the CSR")
+check("the master's rate replaces the printed one where the book differs",
+      abs((crows.get("9-1-4", {}).get("rate") or 0) - 1500) < 0.01,
+      f"9-1-4 -> Rs {crows.get('9-1-4', {}).get('rate')} (abstract printed 22030)")
+check("rates that agree are carried through unchanged",
+      abs((crows.get("1-3-14", {}).get("rate") or 0) - 61) < 0.01 and
+      abs((crows.get("7-1-5", {}).get("rate") or 0) - 127) < 0.01,
+      f"1-3-14 {crows.get('1-3-14', {}).get('rate')} · 7-1-5 {crows.get('7-1-5', {}).get('rate')}")
+check("units come from the CSR, not the abstract's shorthand",
+      crows.get("2-4-5", {}).get("unit") == "Each" and crows.get("1-3-14", {}).get("unit") == "m",
+      f"{crows.get('2-4-5', {}).get('unit')} / {crows.get('1-3-14', {}).get('unit')}")
+check("the printed total and the CSR-valued total are both reported",
+      abs((cstats.get("estimated_amount") or 0) - 668146) < 200 and abs((cstats.get("csr_amount") or 0) - 421786) < 200,
+      f"printed Rs {cstats.get('estimated_amount')} · at CSR rates Rs {cstats.get('csr_amount')}")
+st, imp = call(f"/api/projects/{PID2}/import-estimate", "POST", {"rows": csr_parsed["rows"]}, token=ETOK)
+check("the CSR-mapped abstract imports as a checklist", st == 200 and len(imp.get("created", [])) == 9,
+      f"{len(imp.get('created', []))} items")
+st, cl2 = call(f"/api/projects/{PID2}/checklist", token=ETOK)
+check("checklist carries the legal descriptions, not the printed ones",
+      all(len(i.get("description", "")) > 40 for i in cl2.get("items", [])),
+      f"{len(cl2.get('items', []))} items")
+call(f"/api/projects/{PID2}", "DELETE", token=ATOK)
 
 print("\n[5] Flow B - commit the reconciliation & build the checklist")
 rows = parsed["rows"]
@@ -355,6 +476,8 @@ st, r = call("/api/projects", "POST", {"name": "no auth project"}, token="")
 check("unauthenticated writes rejected", st in (401, 403))
 
 print("\n[12] cleanup - remove every artifact this test created")
+for _pid in org_projects:
+    call(f"/api/projects/{_pid}", "DELETE", token=ATOK)
 st, r = call(f"/api/projects/{PID}", "DELETE", token=ATOK)
 check("project deleted (cascade: items, rooms, measurements, schedule docs)", st == 200, "removed FAT project")
 st, r = call(f"/api/projects/{PID}", token=ATOK)
@@ -366,7 +489,7 @@ check("test user removed", st == 200)
 st, r = call("/api/admin/users/" + str(ATOK_UID), "DELETE", token=ATOK)
 check("admin cannot delete own account", st == 400)
 st, r = call("/api/health")
-check("master DB back to its seeded size", r["items"] == 2268, f"{r['items']} rows")
+check("master DB back to its seeded size", r["items"] == START_ITEMS, f"{r['items']} rows (started at {START_ITEMS})")
 
 print(f"\n{'=' * 64}\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

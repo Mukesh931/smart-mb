@@ -490,6 +490,23 @@ def finish_parse(parsed: list[dict], master_index: dict[str, dict], *, merge: st
     }
 
 
+def _csr_valued_total(out: dict) -> float:
+    """Tender value when every matched row is priced at the Master CSR rate.
+
+    An abstract printed months ago can disagree with the current rate book; the MB (and
+    this total) always follows the master, so the difference is visible instead of silent.
+    """
+    total = 0.0
+    for r in out.get("items", []):
+        rate = (r.get("master") or {}).get("rate")
+        if rate is None:
+            rate = r.get("pdf_rate") or r.get("rate") or 0
+        total += (r.get("pdf_qty") or r.get("qty") or 0) * (rate or 0)
+    for r in out.get("unknown", []):
+        total += (r.get("pdf_qty") or r.get("qty") or 0) * (r.get("pdf_rate") or r.get("rate") or 0)
+    return round(total, 2)
+
+
 def build_master_index(rows: Iterable[dict]) -> dict[str, dict]:
     idx: dict[str, dict] = {}
     for r in rows:
@@ -626,6 +643,179 @@ def parse_csr_rows(rows: list[list[Any]]) -> dict:
         })
     return {"ok": True, "columns": columns, "header_row": headers_idx + 1, "items": out,
             "errors": errors[:60], "error_count": len(errors)}
+
+
+
+# ============================================================== printed CSR engine
+# The department's official CSR is a *printed* table: item code at the left edge, a long
+# description, one unit token, then three rate columns (completed rate, +5% rates, +10%
+# rates).  Codes look like 1-1-1 and may carry a suffix letter (1-3-3d).  Chapter and
+# sub-chapter headings carry the specification number, which is what makes an item
+# traceable back to the printed book.  Reading it by position is deterministic and
+# survives the leading-word drop-outs that defeat naive text extraction.
+CSR_CODE_RE = re.compile(r"^\d{1,3}-\d{1,3}-\d{1,3}[a-z]?$")
+CSR_CHAPTER_RE = re.compile(r"chapter\s*(?:no\.?|:|-)?\s*(\d{1,2})", re.I)
+CSR_SECTION_RE = re.compile(r"^\s*(\d{1,2}\.\d{1,2})\s+(.{3,70}?)\s*\(([^)]{2,24})\)\s*$")
+CSR_MONEY_RE = re.compile(r"^\d{1,9}(?:\.\d{1,2})?$")
+# printed column bands, in points, measured on the official PDF
+CODE_X1 = 80.0        # item code sits at the left edge (x0 ~57-63)
+DESC_X0, DESC_X1 = 80.0, 412.0
+UNIT_X0, UNIT_X1 = 412.0, 450.0   # single unit token just before the money columns
+RATE_X0 = 450.0       # completed rate, then +5%, then +10%
+
+_CSR_TAGS = [
+    ("Fan", r"\bfan\b|exhaust|ceiling fan|pedestal|wall mounting fan"),
+    ("Earthing", r"earth|earthing|electrode|strip.*earth|gi wire"),
+    ("Light Fitting", r"luminaire|lamp|lumens|light fitting|street light|batten|panel light|flood light"),
+    ("LED", r"\bLED\b"),
+    ("Conduit", r"conduit|casing|trunking|box trunking"),
+    ("Wiring", r"\bwire\b|wiring|FRLSH|flexible cable"),
+    ("Cable", r"\bcable\b|XLPE|armoured|HT cable|LT cable"),
+    ("Switch/Socket", r"switch|socket|modular"),
+    ("DB", r"distribution board|\bDB\b|panel board"),
+    ("Panel", r"control panel|\bpanel\b|\bMCC\b|feeder pillar"),
+    ("Protection", r"\bMCB\b|\bMCCB\b|\bRCCB\b|\bRCBO\b|isolator|fuse|SPMCB|ELCB"),
+    ("Transformer", r"transformer"),
+    ("Motor", r"\bmotor\b|pump set|submersible"),
+    ("Generator", r"generator|DG set"),
+    ("Pole", r"\bpole\b|octagonal|swaged|mast"),
+    ("Street Light", r"street light|sodium|street lighting"),
+    ("Fire", r"fire|sprinkler|hydrant|alarm"),
+    ("Water Pump", r"water pump|monoblock|submersible pump"),
+    ("Lift", r"\blift\b|elevator"),
+    ("Siren", r"siren"),
+    ("Testing", r"testing|commissioning|megger"),
+    ("Dismantling", r"dismantl|credit"),
+    ("Civil", r"excavation|trench|foundation|concrete|brick|plaster"),
+]
+_CATEGORY_BY_CHAPTER = {
+    1: "Wiring", 2: "Fittings", 3: "Appliances", 4: "Energy Saving Devices", 5: "Switchgears",
+    6: "Control Panel", 7: "Cables", 8: "Over Head Systems", 9: "Earthing", 10: "Sub Stations",
+    11: "Generators", 12: "Water Pumps", 13: "Fire Fighting & Fire Alarm",
+    14: "Temporary Illumination", 15: "Siren", 16: "Civil Works", 17: "Lift",
+    18: "Miscellaneous", 19: "Credit for Dismantled Material",
+}
+
+
+def _clean(text: str) -> str:
+    t = re.sub(r"\s+", " ", text or "").strip()
+    return t
+
+
+def parse_csr_pdf(path: str) -> list[dict]:
+    """Walk the printed CSR page by page.
+
+    Rows are found by their item code in the left column; everything on the lines
+    between one code and the next belongs to that row.  Words are bucketed into visual
+    lines (3 pt tolerance) because a row's code and its description are typeset at
+    baselines that can differ by hundredths of a point.
+    """
+    import pymupdf
+    doc = pymupdf.open(path)
+    items: list[dict] = []
+    chapter_no, chapter_name, section, spec_no = None, "", "", ""
+
+    for pno, page in enumerate(doc):
+        words = page.get_text("words")
+        if not words:
+            continue
+        buckets: dict[int, list] = {}
+        for w in words:
+            buckets.setdefault(int(round(w[1] / 3.0)), []).append(w)
+        line_keys = sorted(buckets)
+        line_of = {id(w): k for k, ws in buckets.items() for w in ws}
+
+        # ---- headings: chapter and sub-chapter (the sub-chapter carries the spec no)
+        for raw in (page.get_text() or "").split("\n"):
+            l = _clean(raw)
+            if not l or len(l) > 95:
+                continue
+            if re.match(r"^\d{1,3}-\d{1,3}-\d{1,3}", l):      # an item row, not a heading
+                continue
+            m = CSR_CHAPTER_RE.search(l)
+            if m and re.search(r"[A-Za-z]{3}", l):
+                chapter_no = int(m.group(1))
+                chapter_name = _CATEGORY_BY_CHAPTER.get(chapter_no, l[:60])
+            if re.match(r"^\d{1,2}\.\d{1,2}\s", l):          # "1.1 Concealing of Conduits (WG-MA/CC)"
+                m2 = CSR_SECTION_RE.match(l)
+                if m2:
+                    section, spec_no = f"{m2.group(1)} {_clean(m2.group(2))}", _clean(m2.group(3))
+
+        code_words = sorted([w for w in words if w[0] < CODE_X1 and CSR_CODE_RE.match(w[4])],
+                            key=lambda w: (line_of[id(w)], w[0]))
+        if not code_words:
+            continue
+        first_line, last_line = line_keys[0], line_keys[-1]
+
+        for i, code in enumerate(code_words):
+            k0 = line_of[id(code)]
+            k1 = line_of[id(code_words[i + 1])] - 1 if i + 1 < len(code_words) else last_line
+            band = [w for k in line_keys if k0 <= k <= k1 for w in buckets[k]]
+
+            desc_words = sorted([w for w in band if DESC_X0 <= w[0] < DESC_X1],
+                                key=lambda w: (line_of[id(w)], w[0]))
+            description = _clean(" ".join(w[4] for w in desc_words))
+
+            unit_words = [w for w in band if UNIT_X0 <= w[0] < UNIT_X1 and not CSR_MONEY_RE.match(w[4])]
+            unit = _clean(unit_words[0][4]) if unit_words else ""
+
+            # the money columns of a row sit on the same printed line as its item code
+            own_line = sorted([w for w in buckets.get(k0, []) if w[0] >= RATE_X0 and CSR_MONEY_RE.match(w[4])],
+                              key=lambda w: w[0])
+            money = own_line or sorted([w for w in band if w[0] >= RATE_X0 and CSR_MONEY_RE.match(w[4])],
+                                       key=lambda w: (line_of[id(w)], w[0]))
+            nums = [float(w[4]) for w in money]
+
+            items.append({
+                "item_code": code[4].lower(), "description": description, "unit": unit,
+                "rate": nums[0] if nums else 0.0,
+                "rate_5pct": nums[1] if len(nums) > 1 else 0.0,
+                "rate_10pct": nums[2] if len(nums) > 2 else 0.0,
+                "chapter": chapter_no, "category": chapter_name,
+                "section": section, "spec_no": spec_no, "page": pno + 1,
+            })
+    return items
+
+
+
+
+def tags_for(description: str) -> list[str]:
+    """Keyword tags driven by the printed wording (no model call): they power the
+    Extra-Item search and keep the descriptive-schedule matcher honest."""
+    d = description or ""
+    return [name for name, pat in _CSR_TAGS if re.search(pat, d, re.I)]
+
+
+def parse_csr_csv(path: str) -> list[dict]:
+    """Read a CSR table that was already parsed and saved (plain CSV or the gzip
+    snapshot shipped in samples/) - this is how a deployed instance seeds itself."""
+    import csv as _csv
+    import gzip as _gzip
+    opener = _gzip.open if path.endswith(".gz") else open
+    out = []
+    with opener(path, "rt", encoding="utf-8") as fh:
+        for row in _csv.DictReader(fh):
+            it = dict(row)
+            for k in ("rate", "rate_5pct", "rate_10pct"):
+                try:
+                    it[k] = float(it.get(k) or 0)
+                except (TypeError, ValueError):
+                    it[k] = 0.0
+            it["chapter"] = int(it["chapter"]) if str(it.get("chapter") or "").isdigit() else None
+            out.append(it)
+    return out
+
+
+def write_csr_csv(items: Iterable[dict], path: str) -> str:
+    import csv as _csv
+    cols = ["item_code", "description", "unit", "rate", "rate_5pct", "rate_10pct",
+            "chapter", "category", "section", "spec_no", "page"]
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = _csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        for it in items:
+            w.writerow({k: it.get(k, "") for k in cols})
+    return path
 
 
 # ===================================================================== PDF column engine
@@ -834,4 +1024,5 @@ def parse_estimate_pdf(path: str, master_index: dict[str, dict], *, merge: str =
     out["stats"]["amount_cross_checked"] = sum(1 for r in rows if r["confidence"] >= 0.97)
     out["stats"]["estimated_amount"] = round(
         sum((r["pdf_qty"] or 0) * (r["pdf_rate"] or 0) for r in rows), 2)
+    out["stats"]["csr_amount"] = _csr_valued_total(out)
     return out

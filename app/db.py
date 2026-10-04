@@ -128,6 +128,16 @@ CREATE TABLE IF NOT EXISTS users (
     last_login      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS org_units (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent_id   INTEGER REFERENCES org_units(id),
+    kind        TEXT NOT NULL,                 -- division | subdivision | section
+    name        TEXT NOT NULL,
+    code        TEXT,
+    is_active   INTEGER DEFAULT 1,
+    created_at  TEXT,
+    UNIQUE (parent_id, name)
+);
 CREATE TABLE IF NOT EXISTS csr_versions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     fy          TEXT NOT NULL,                 -- e.g. 2024-25
@@ -336,6 +346,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if cols and "client_ref" not in cols:
         conn.execute("ALTER TABLE measurements ADD COLUMN client_ref TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meas_client ON measurements (client_ref, project_id)")
+
+    # organisation: every user and every project sits somewhere in the division tree
+    for table in ("users", "projects"):
+        tcols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if tcols and "org_unit_id" not in tcols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN org_unit_id INTEGER REFERENCES org_units(id)")
+    ucols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if ucols and "section" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN section TEXT")
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+    if pcols and "section" not in pcols:
+        conn.execute("ALTER TABLE projects ADD COLUMN section TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_project_org ON projects (org_unit_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_org ON users (org_unit_id)")
     conn.commit()
 
 

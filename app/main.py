@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db, parsing, reports, schedule as sch, schedule_store, seed
+from . import auth, db, org, parsing, reports, schedule as sch, schedule_store, seed
 from . import backup
 from .db import (DATA_DIR, DB_PATH, PHOTO_DIR, SAMPLE_DIR, UPLOAD_DIR, audit, ex, json_load,
                  now_iso, q, q1, rows_to_dicts)
@@ -77,6 +77,7 @@ class LoginIn(BaseModel):
 
 class ProjectIn(BaseModel):
     name: str
+    org_unit_id: int | None = None
     scheme: str = ""
     division: str = ""
     circle: str = ""
@@ -127,6 +128,12 @@ class ConfirmImportIn(BaseModel):
 def user_public(row: Any) -> dict:
     d = dict(row)
     d.pop("password_hash", None)
+    unit = org.unit(d.get("org_unit_id"))
+    d["org_unit_name"] = unit["name"] if unit else (d.get("division") or "")
+    d["org_kind"] = unit["kind"] if unit else ""
+    d["org_path"] = org.path_of(d.get("org_unit_id")) if d.get("org_unit_id") else ""
+    d["role_label"] = org.ROLE_LABEL.get(d.get("role"), d.get("role"))
+    d["scope_label"] = org.scope_label(d)
     return d
 
 
@@ -319,20 +326,46 @@ def csr_suggest(qtext: str = Query(..., alias="q"), fy: str = Query(""), region:
     rows = rows_to_dicts(q(
         "SELECT * FROM master_items WHERE fy=? AND region=? AND is_active=1", (fy, region)))
     scored = []
+    phrase = re.sub(r"\s+", " ", qtext.strip().lower())
     for r in rows:
         tags = json_load(r["tags"], [])
-        blob = f"{r['item_code']} {r['short_desc'] or ''} {r['description']} {r['section'] or ''} {' '.join(tags)} {r['spec_no'] or ''}".lower()
-        score = 0.0
+        desc = (r["description"] or "").lower()
+        blob = f"{r['item_code']} {r['short_desc'] or ''} {desc} {r['section'] or ''} {' '.join(tags)} {r['spec_no'] or ''}".lower()
+        score, covered = 0.0, 0
         for t in tokens:
             if t == r["item_code"].lower():
                 score += 12
             if t in [x.lower() for x in tags]:
                 score += 6
-            score += blob.count(t) * (1.6 if len(t) > 4 else 1.0)
-            if re.search(rf"\b{re.escape(t)}", blob):
-                score += 1.2
-        if score > 0:
-            scored.append((score, r))
+            # a term repeated in a long paragraph must not outrank a short, exact item:
+            # count saturates at 2, and the position of the first hit matters
+            hits = blob.count(t)
+            if hits:
+                covered += 1
+                score += min(hits, 2) * (1.6 if len(t) > 4 else 1.0)
+                if re.search(rf"\b{re.escape(t)}", blob):
+                    score += 1.2
+                # the head noun of the query should appear early in the item wording;
+                # "SS enclosure for MCCB" is an enclosure, not the MCCB
+                head = desc[:60]
+                if re.search(rf"\b{re.escape(t)}", head):
+                    score += 1.5
+                elif re.search(rf"\b{re.escape(t)}", desc[:120]):
+                    score += 0.5
+        if score <= 0:
+            continue
+        coverage = covered / max(1, len(tokens))
+        score *= coverage ** 2                       # every word of the query should appear
+        if phrase and phrase in desc:
+            score *= 1.3                             # the query appears verbatim
+        # "SS enclosure for MCCB" is an enclosure; "foundation for pole" is a foundation.
+        # A purpose clause ("... for <the query>") should not outrank the item itself.
+        if any(re.search(rf"\bfor\s+(the\s+)?{re.escape(t)}\b", desc) for t in tokens):
+            score *= 0.8
+        score *= sch.intent_factor(qtext, r["description"] or "")
+        # a 700-character specification paragraph is a worse answer than a crisp one
+        score *= 1 / (1 + min(len(desc), 1600) / 4000)
+        scored.append((score, r))
     scored.sort(key=lambda x: (-x[0], x[1]["item_code"]))
     out = []
     for s, r in scored[:limit]:
@@ -365,6 +398,43 @@ def csr_export(fy: str = Query(...), region: str = Query(...), user: dict = Depe
                     headers={"Content-Disposition": f'attachment; filename="MasterCSR_{fy}_{region}.xlsx"'})
 
 
+def _commit_csr(items: list[dict], new_codes: list, updates: list, response: dict, fy: str, region: str,
+                mode: str, source_file: str, user: dict) -> dict:
+    """Write a validated CSR into the Master Database (shared by the PDF and sheet paths)."""
+    ts = now_iso()
+    if mode == "replace":
+        ex("DELETE FROM master_items WHERE fy=? AND region=?", (fy, region))
+    for it in items:
+        tags = json.dumps(it["tags"] or [])
+        exist = q1("SELECT id FROM master_items WHERE fy=? AND region=? AND item_code=?", (fy, region, it["item_code"]))
+        if exist:
+            ex("UPDATE master_items SET description=?, unit=?, rate=?, material_rate=?, labour_rate=?,"
+               " category=?, section=?, spec_no=?, tags=?, chapter=?, short_desc=?, is_active=1, updated_at=?"
+               " WHERE id=?", (it["description"], it["unit"], it["rate"], it["material_rate"], it["labour_rate"],
+                               it["category"], it["section"], it["spec_no"], tags, it["chapter"],
+                               seed._short(it["description"]), ts, exist["id"]))
+        else:
+            ex("INSERT INTO master_items (fy, region, item_code, description, short_desc, unit, rate, material_rate,"
+               " labour_rate, chapter, section, category, spec_no, tags, is_new, is_active, created_at, updated_at)"
+               " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)",
+               (fy, region, it["item_code"], it["description"], it["description"][:74], it["unit"], it["rate"],
+                it["material_rate"], it["labour_rate"], it["chapter"], it["section"], it["category"],
+                it["spec_no"], tags, ts, ts))
+    ver = q1("SELECT id FROM csr_versions WHERE fy=? AND region=?", (fy, region))
+    live = q1("SELECT COUNT(*) AS c FROM master_items WHERE fy=? AND region=?", (fy, region))["c"]
+    if ver:
+        ex("UPDATE csr_versions SET item_count=?, source_file=?, uploaded_by=?, uploaded_at=?, status='active'"
+           " WHERE id=?", (live, source_file, user["id"], ts, ver["id"]))
+    else:
+        ex("INSERT INTO csr_versions (fy, region, status, item_count, source_file, uploaded_by, uploaded_at)"
+           " VALUES (?,?,?,?,?,?,?)", (fy, region, "active", live, source_file, user["id"], ts))
+    audit(user, "CSR_IMPORTED", "master_items", f"{fy}/{region}",
+          {"mode": mode, "items": len(items), "new": len(new_codes), "updates": len(updates),
+           "file": source_file, "live": live})
+    rows2 = rows_to_dicts(q("SELECT * FROM master_items WHERE fy=? AND region=? LIMIT 5", (fy, region)))
+    return {**response, "committed": True, "live_count": live, "sample": rows2}
+
+
 @app.post("/api/csr/import")
 async def csr_import(file: UploadFile = File(...), fy: str = Form(...), region: str = Form(...),
                      mode: str = Form("merge"), commit: bool = Form(False),
@@ -378,6 +448,43 @@ async def csr_import(file: UploadFile = File(...), fy: str = Form(...), region: 
 
     rows: list[list[Any]] = []
     ext = os.path.splitext(safe)[1].lower()
+    if ext == ".pdf":
+        # the printed CSR itself: read the table by column position
+        try:
+            pdf_items = parsing.parse_csr_pdf(path)
+        except Exception as exc:
+            raise HTTPException(400, f"Could not read the CSR PDF: {exc}")
+        if len(pdf_items) < 10:
+            raise HTTPException(400, f"Only {len(pdf_items)} item rows were read from that PDF - "
+                                     "is it the printed CSR (item codes 1-1-1 … 19-x-x)?")
+        items = []
+        for it in pdf_items:
+            desc = (it.get("description") or "").strip()
+            if not it.get("item_code") or len(desc) < 8:
+                continue
+            items.append({"item_code": it["item_code"], "description": desc,
+                          "unit": (it.get("unit") or "Each").strip() or "Each",
+                          "rate": float(it.get("rate") or 0), "material_rate": 0.0, "labour_rate": 0.0,
+                          "category": it.get("category") or "", "section": it.get("section") or "",
+                          "spec_no": it.get("spec_no") or "", "chapter": it.get("chapter"),
+                          "tags": parsing.tags_for(desc), "rate_5pct": it.get("rate_5pct"),
+                          "rate_10pct": it.get("rate_10pct"), "page": it.get("page")})
+        no_rate = sum(1 for i in items if not i["rate"])
+        parsed = {"ok": True, "items": items, "errors": ([{"row": "", "reason": f"{no_rate} row(s) carry no completed rate "
+                  "(marked 0.00 - verify on site)"}] if no_rate else []), "error_count": no_rate,
+                  "columns": {"engine": "pdf-column-table", "source": "printed CSR PDF"}, "header_row": 0}
+        existing_pdf = {r["item_code"] for r in q("SELECT item_code FROM master_items WHERE fy=? AND region=?", (fy, region))}
+        new_pdf = [i["item_code"] for i in items if i["item_code"] not in existing_pdf]
+        upd_pdf = [i["item_code"] for i in items if i["item_code"] in existing_pdf]
+        response = {"ok": True, "columns_detected": parsed["columns"], "header_row": 0,
+                    "items": items[:200], "item_count": len(items), "new": len(new_pdf),
+                    "updates": len(upd_pdf), "errors": parsed["errors"], "error_count": parsed["error_count"],
+                    "committed": False, "fy": fy, "region": region,
+                    "engines": {"pdf": len(items), "sheet": 0}}
+        if not commit:
+            return response
+        parsed_items = items
+        return _commit_csr(parsed_items, new_pdf, upd_pdf, response, fy, region, mode, safe, user)
     try:
         if ext in (".xlsx", ".xlsm"):
             from openpyxl import load_workbook
@@ -398,7 +505,7 @@ async def csr_import(file: UploadFile = File(...), fy: str = Form(...), region: 
         raise HTTPException(400, f"Could not read the file: {exc}")
 
     parsed = parsing.parse_csr_rows(rows)
-    if not parsed["ok"]:
+    if not parsed.get("ok"):
         return JSONResponse({"ok": False, "error": parsed["error"], "preview": [
             [str(c) for c in r] for r in parsed.get("preview", [])]}, status_code=200)
 
@@ -415,39 +522,8 @@ async def csr_import(file: UploadFile = File(...), fy: str = Form(...), region: 
     if not commit:
         return response
 
-    ts = now_iso()
-    if mode == "replace":
-        ex("DELETE FROM master_items WHERE fy=? AND region=?", (fy, region))
-    for it in parsed["items"]:
-        tags = json.dumps(it["tags"] or [])
-        exist = q1("SELECT id FROM master_items WHERE fy=? AND region=? AND item_code=?", (fy, region, it["item_code"]))
-        if exist:
-            ex("UPDATE master_items SET description=?, unit=?, rate=?, material_rate=?, labour_rate=?,"
-               " category=?, section=?, spec_no=?, tags=?, chapter=?, short_desc=?, is_active=1, updated_at=?"
-               " WHERE id=?", (it["description"], it["unit"], it["rate"], it["material_rate"], it["labour_rate"],
-                               it["category"], it["section"], it["spec_no"], tags, it["chapter"],
-                               seed._short(it["description"]),
-                               ts, exist["id"]))
-        else:
-            ex("INSERT INTO master_items (fy, region, item_code, description, short_desc, unit, rate, material_rate,"
-               " labour_rate, chapter, section, category, spec_no, tags, is_new, is_active, created_at, updated_at)"
-               " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)",
-               (fy, region, it["item_code"], it["description"], it["description"][:74], it["unit"], it["rate"],
-                it["material_rate"], it["labour_rate"], it["chapter"], it["section"], it["category"],
-                it["spec_no"], tags, ts, ts))
-    ver = q1("SELECT id FROM csr_versions WHERE fy=? AND region=?", (fy, region))
-    live = q1("SELECT COUNT(*) AS c FROM master_items WHERE fy=? AND region=?", (fy, region))["c"]
-    if ver:
-        ex("UPDATE csr_versions SET item_count=?, source_file=?, uploaded_by=?, uploaded_at=?, status='active'"
-           " WHERE id=?", (live, safe, user["id"], ts, ver["id"]))
-    else:
-        ex("INSERT INTO csr_versions (fy, region, status, item_count, source_file, uploaded_by, uploaded_at)"
-           " VALUES (?,?,?,?,?,?,?)", (fy, region, "active", live, safe, user["id"], ts))
-    audit(user, "CSR_IMPORTED", "master_items", f"{fy}/{region}",
-          {"mode": mode, "items": len(parsed["items"]), "new": len(new_codes), "updates": len(updates),
-           "file": safe, "live": live})
-    rows2 = rows_to_dicts(q("SELECT * FROM master_items WHERE fy=? AND region=? LIMIT 5", (fy, region)))
-    return {**response, "committed": True, "live_count": live, "sample": rows2}
+    return _commit_csr(parsed["items"], new_codes, updates, response, fy, region, mode, safe, user)
+
 
 
 @app.delete("/api/csr/versions")
@@ -540,13 +616,26 @@ def deviation_rows(pid: int) -> list[dict]:
 
 
 @app.get("/api/projects")
-def list_projects(user: dict = Depends(current_user)):
-    if user["role"] == "admin":
-        rows = q("SELECT p.*, u.name AS engineer_name FROM projects p LEFT JOIN users u ON u.id=p.engineer_id"
-                 " ORDER BY p.created_at DESC")
-    else:
-        rows = q("SELECT p.*, u.name AS engineer_name FROM projects p LEFT JOIN users u ON u.id=p.engineer_id"
-                 " WHERE p.engineer_id=? ORDER BY p.created_at DESC", (user["id"],))
+def list_projects(user: dict = Depends(current_user), mine: int = 0):
+    """Projects the officer may see.
+
+    Admin sees every project, an EE the whole division, an SDO their sub-division and a
+    section officer their own section (plus any project they created themselves).  ``mine=1``
+    narrows that to the projects the officer owns.
+    """
+    where, params = org.project_sql(user, "p")
+    if user["role"] != "admin":
+        where = f"(({where}) OR p.engineer_id=?)"
+        params = list(params) + [user["id"]]
+    if mine:
+        where = f"({where}) AND p.engineer_id=?"
+        params = list(params) + [user["id"]]
+    rows = q(f"""SELECT p.*, u.name AS engineer_name, o.name AS org_name, o.kind AS org_kind,
+                        parent.name AS org_parent
+                 FROM projects p LEFT JOIN users u ON u.id=p.engineer_id
+                 LEFT JOIN org_units o ON o.id=p.org_unit_id
+                 LEFT JOIN org_units parent ON parent.id=o.parent_id
+                 WHERE {where} ORDER BY p.created_at DESC""", tuple(params))
     out = []
     for r in rows:
         d = dict(r)
@@ -570,13 +659,21 @@ def create_project(body: ProjectIn, user: dict = Depends(current_user)):
     ts = now_iso()
     seq = (q1("SELECT COUNT(*) AS c FROM projects")["c"] or 0) + 1
     code = f"PWDE/ELE/{(body.region or 'Pune').upper()[:6]}/{body.csr_fy}/{seq:03d}"
+    unit_id = body.org_unit_id or org.default_unit_for(user)
+    if unit_id and not org.unit(unit_id):
+        raise HTTPException(400, "Unknown organisation unit")
+    unit = org.unit(unit_id)
+    ancestors = org.ancestors(unit_id)
+    division = body.division or (ancestors.get("division") or {}).get("name") or user.get("division", "")
+    section = unit["name"] if unit and unit["kind"] == "section" else None
     pid = ex("""INSERT INTO projects (project_code, name, scheme, division, circle, region, engineer_id,
                 estimate_no, ts_no, ts_date, ts_amount, csr_fy, csr_region, mb_no, agreement_no, agency,
-                status, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?)""",
-             (code, body.name, body.scheme, body.division or user.get("division", ""), body.circle or user.get("circle", ""),
+                org_unit_id, section, status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?)""",
+             (code, body.name, body.scheme, division, body.circle or user.get("circle", ""),
               body.region, user["id"], body.estimate_no, body.ts_no, body.ts_date, body.ts_amount,
-              body.csr_fy, body.csr_region, body.mb_no or "MB-01", body.agreement_no, body.agency, ts, ts)).lastrowid
+              body.csr_fy, body.csr_region, body.mb_no or "MB-01", body.agreement_no, body.agency,
+              unit_id, section, ts, ts)).lastrowid
     if body.rooms:
         for i, r in enumerate(body.rooms, start=1):
             ex("INSERT INTO rooms (project_id, floor, name, sort_order, created_at) VALUES (?,?,?,?,?)",
@@ -1385,11 +1482,16 @@ def admin_overview(user: dict = Depends(admin_only)):
     def one(sql):
         return list(dict(q1(sql)).values())[0]
     return {
-        "users": rows_to_dicts(q("SELECT id, name, email, role, designation, division, circle, region, is_active,"
-                                 " created_at, last_login FROM users ORDER BY role, name")),
+        # users are reported through user_public() so the admin screen sees each officer's
+        # posting and the scope it gives them, not just a free-text division string
+        "users": [user_public(r) for r in q(
+            "SELECT id, name, email, role, designation, division, circle, region, is_active, org_unit_id,"
+            " section, created_at, last_login FROM users"
+            " ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'ee' THEN 1 WHEN 'sdo' THEN 2"
+            " WHEN 'section' THEN 3 ELSE 4 END, name")],
         "stats": {
             "user_count": one("SELECT COUNT(*) FROM users"),
-            "engineer_count": one("SELECT COUNT(*) FROM users WHERE role='engineer'"),
+            "engineer_count": one("SELECT COUNT(*) FROM users WHERE role!='admin'"),
             "master_rows": one("SELECT COUNT(*) FROM master_items"),
             "versions": one("SELECT COUNT(*) FROM csr_versions"),
             "items_per_version": rows_to_dicts(q("SELECT fy, region, item_count, status, source_file, uploaded_at"
@@ -1407,6 +1509,37 @@ def admin_overview(user: dict = Depends(admin_only)):
     }
 
 
+@app.get("/api/org")
+def org_tree(user: dict = Depends(current_user)):
+    """The division tree plus what this officer is allowed to see."""
+    return {
+        "tree": org.tree(),
+        "divisions": rows_to_dicts(q("SELECT * FROM org_units WHERE kind='division' AND is_active=1 ORDER BY name")),
+        "subdivisions": rows_to_dicts(q("SELECT * FROM org_units WHERE kind='subdivision' AND is_active=1 ORDER BY name")),
+        "sections": rows_to_dicts(q("SELECT * FROM org_units WHERE kind='section' AND is_active=1 ORDER BY name")),
+        "roles": [{"id": r, "label": org.ROLE_LABEL[r], "kind": org.ROLE_KIND.get(r, "")} for r in org.ROLES],
+        "my_scope": org.scope_label(user),
+        "my_unit": user.get("org_unit_id"),
+    }
+
+
+@app.post("/api/admin/org")
+def admin_create_unit(body: dict, user: dict = Depends(admin_only)):
+    kind = (body.get("kind") or "").strip()
+    name = (body.get("name") or "").strip()
+    if kind not in org.KINDS:
+        raise HTTPException(400, f"kind must be one of {', '.join(org.KINDS)}")
+    if not name:
+        raise HTTPException(400, "Name is required")
+    parent = org.unit(body.get("parent_id"))
+    if kind != "division" and not parent:
+        raise HTTPException(400, "Choose the parent unit")
+    uid = ex("INSERT INTO org_units (parent_id, kind, name, code, is_active, created_at) VALUES (?,?,?,?,1,?)",
+             (parent["id"] if parent else None, kind, name, org._code_for(name), now_iso())).lastrowid
+    audit(user, "ORG_UNIT_CREATED", "org_units", uid, f"{kind}: {name}")
+    return {"ok": True, "unit_id": uid}
+
+
 @app.post("/api/admin/users")
 def admin_create_user(body: dict, user: dict = Depends(admin_only)):
     email = (body.get("email") or "").strip()
@@ -1414,18 +1547,27 @@ def admin_create_user(body: dict, user: dict = Depends(admin_only)):
         raise HTTPException(400, "Name and email are required")
     if q1("SELECT id FROM users WHERE lower(email)=lower(?)", (email,)):
         raise HTTPException(409, "Email already registered")
-    uid = ex("INSERT INTO users (name,email,password_hash,role,designation,division,circle,region,phone,is_active,"
-             "created_at) VALUES (?,?,?,?,?,?,?,?,?,1,?)",
+    role = body.get("role", "engineer")
+    if role not in org.ROLES:
+        raise HTTPException(400, f"Role must be one of {', '.join(org.ROLES)}")
+    unit = org.unit(body.get("org_unit_id"))
+    if unit and org.ROLE_KIND.get(role) and unit["kind"] != org.ROLE_KIND[role]:
+        raise HTTPException(400, f"A {org.ROLE_LABEL[role]} must be posted to a {org.ROLE_KIND[role]}")
+    uid = ex("INSERT INTO users (name,email,password_hash,role,designation,division,circle,region,phone,"
+             "org_unit_id,section,is_active,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?)",
              (body["name"], email, auth.hash_password(body.get("password") or "Welcome@123"),
-              body.get("role", "engineer"), body.get("designation", ""), body.get("division", ""),
-              body.get("circle", ""), body.get("region", "Pune"), body.get("phone", ""), now_iso())).lastrowid
+              role, body.get("designation", ""), body.get("division", "") or org.DIVISION,
+              body.get("circle", ""), body.get("region", "Pune"), body.get("phone", ""),
+              unit["id"] if unit else None, unit["name"] if unit and unit["kind"] == "section" else None,
+              now_iso())).lastrowid
     audit(user, "USER_CREATED", "users", uid, email)
     return {"ok": True, "user_id": uid, "default_password": body.get("password") or "Welcome@123"}
 
 
 @app.patch("/api/admin/users/{uid}")
 def admin_update_user(uid: int, body: dict, user: dict = Depends(admin_only)):
-    allowed = {"role", "is_active", "designation", "division", "circle", "region", "name", "phone"}
+    allowed = {"role", "is_active", "designation", "division", "circle", "region", "name", "phone",
+               "org_unit_id", "section"}
     sets, params = [], []
     for k, v in body.items():
         if k in allowed:

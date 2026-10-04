@@ -61,6 +61,10 @@ def build_snapshot() -> dict:
         for x in overview["stats"]["items_per_version"]]
     return {
         "user": admin,
+        "org": main.org_tree(admin),
+        "backup": {"configured": False, "repo": "(demo)", "storage": "ephemeral", "last_push": None,
+                   "last_restore": None, "pending": False, "db_bytes": 0, "data_dir": "(demo snapshot)",
+                   "path": "", "interval": 0},
         "versions": versions,
         "facets": facets,
         "csr_items": {"total": len(it_rows), "items": it_rows, "limit": 120, "offset": 0},

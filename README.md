@@ -93,6 +93,11 @@ column-linking sheet — against the demo snapshot: **22/22 pass**.
 * Full **Master Database** of the Electrical CSR with `item_code`, legal description, short
   description, unit, **material / labour / completed rate**, chapter, section, category, specification
   number and **metadata tags** (`Fan`, `Earthing`, `LED`, `Safety`, …).
+* The auto-matcher that joins a **descriptive schedule** column ("Ceiling Fan 1200 mm") to an item
+  carries **intent rules**: a row that only *dismantles*, *rewinds*, *recesses* or merely *erects a
+  departmentally supplied* item mentions the same nouns but is the wrong row, so it is damped (×0.45–0.65),
+  while `Supplying and erecting …` is preferred. Values are clamped to 1.00, and the estimate always
+  outranks the master list as the target — the CSR is the shortlist, the estimate is the contract.
 * Ships with a **demo subset of 163 items across 8 chapters** (1 Wiring · 2 Light Fittings · 3 Fans ·
   5 HT & Substation · 6 DB & Switchgear · 7 Cables · 9 Earthing · 14 Temporary & Misc), item codes in
   the official three-part form (`1-3-6`, `2-1-11`, `9-1-4`, `14-3-1`), materialised for
@@ -104,6 +109,49 @@ column-linking sheet — against the demo snapshot: **22/22 pass**.
   auto-located, malformed rows are reported with spreadsheet row numbers, and each version is tracked
   (`source_file`, `uploaded_at`, `item_count`, `status`).
 * **Export** any FY × region back to Excel; **tag editor** per item; **audit trail** for every change.
+
+#### The official CSR itself (printed PDF → Master Database)
+
+The department's CSR is published as a **printed book** (`PWD Electrical CSR 2022-23.pdf`, 224 pages,
+chapters 1–19). The admin screen accepts that PDF directly: the table is read **by column position**
+(item code at the left edge, description 80–412 pt, one unit token 412–450 pt, then the three rate
+columns — completed rate, +5 % rate, +10 % rate) because the printed book typesets the code and its
+description at baselines that differ by hundredths of a point, which defeats plain text extraction.
+Chapter and sub-chapter headings are captured as `category` / `section` / `spec_no`
+(`1.3 Bunch of Wires`, `WG-MA/BW`), and each item is keyword-tagged for the Extra-Item search.
+
+* **Loaded:** **2 319 items** of the **2022-23 Maharashtra** rate book — every chapter, e.g.
+  `1-1-1 m ₹197.00`, `2-4-5 Each ₹4 970.00` (60 W LED street light), `9-1-4 Each ₹1 500.00`,
+  `16-3-9 Each ₹3 684.00`. The snapshot is committed as
+  `samples/csr_2022-23_maharashtra.csv.gz` (127 KB) so a fresh instance **seeds itself with the real
+  rate book at first boot** and after any restart, and the PDF can always be re-imported or replaced
+  with next year's book from the same screen.
+* Verified against a real division abstract: all **11 of 11** coded rows resolved, and the rate printed
+  on the abstract matched the CSR for every one of them (`1-3-14 m 61.00`, `5-4-13 Each 400.00`,
+  `7-6-9 m 210.00`, `8-2-12 Each 15 067.00`, …) — the abstract had been priced from this very book.
+* CLI for bulk work: `python3 -m tools.import_csr <pdf|csv|.csv.gz> --fy 2022-23 --region Maharashtra --db-import`.
+
+### 2.1b Organisation — division, sub-division, sections
+
+The app models where the work belongs, because that is what decides who sees and signs what:
+
+```
+PWD Electrical Division Dhule                     ← ee   (Executive Engineer)
+  └── PWD Electrical Sub Division Jalgaon         ← sdo  (Sub Divisional Officer)
+        ├── Jalgaon-1   ┐
+        ├── Jalgaon-2   ├─ section officers (JE)
+        └── Amalner     ┘
+```
+
+* Roles `admin` / `ee` / `sdo` / `section` (+ the legacy `engineer`). **Scope follows the hierarchy:**
+  the EE sees every work of the division, the SDO every work of the sub-division, a section officer only
+  their own section — plus every project they created themselves. The rule is enforced **server-side**
+  on `/api/projects` (nothing is hidden only in the browser) and shown to the officer as
+  *"Sees: PWD Electrical Division Dhule › … › Jalgaon-1"*.
+* Every officer of the division is seeded with a password (`ee.dhule@`, `sdo.jalgaon@`,
+  `je.jalgaon1@`, `je.jalgaon2@`, `je.amalner@` … / `Engineer@123`), and **Admin → Users** lets a
+  super admin create accounts, choose the role and **change a posting**; the project form defaults the
+  section to the creator's own post and always shows which **CSR version** the work will be mapped to.
 
 ### 2.2 Project creation & the “Smart Import” (anchor-based extraction)
 

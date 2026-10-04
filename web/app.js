@@ -19,7 +19,14 @@ const S = {
   schedulePreview: null,
   importPreview: null,
   adminTab: 'master',
+  org: null,
 };
+
+async function loadOrg() {
+  if (S.org) return S.org;
+  try { S.org = await api('/api/org'); } catch (e) { S.org = { tree: [], sections: [], subdivisions: [], divisions: [], roles: [] }; }
+  return S.org;
+}
 
 /* ============================================================ offline outbox
    Site engineers work in places with one bar of signal.  Every write that records
@@ -195,6 +202,8 @@ function demoLookup(path, method) {
     [/^\/projects\/(\d+)\/measurements$/, () => ({ measurements: DEMO.measurements, count: DEMO.measurements.length, total_amount: 0 })],
     [/^\/admin\/overview$/, () => DEMO.admin],
     [/^\/admin\/parse-jobs$/, () => ({ jobs: [] })],
+    [/^\/org$/, () => DEMO.org],
+    [/^\/admin\/backup$/, () => DEMO.backup],
     [/^\/auth\/me$/, () => ({ user: DEMO.user })],
   ];
   for (const [re, fn] of map) { const m = p.match(re); if (m) { const r = fn(m); if (r) return r; } }
@@ -275,6 +284,7 @@ function sheet({ title, subtitle, body, footer, wide = false, onOpen, body_id, s
       <button class="btn sm" data-act="close-sheet">${ICON.x}</button></div>
     <div class="bd"${body_id ? ` id="${body_id}"` : ''}>${body}</div>
     ${footer ? `<div class="ft${sticky ? ' sticky' : ''}">${footer}</div>` : ''}</div>`;
+  S.lastSheet = el.innerHTML;      // kept so the headless UI harness can inspect a sheet
   document.body.appendChild(el);
   el.addEventListener('click', (e) => {
     if (e.target === el || e.target.closest('[data-act="close-sheet"]')) closeSheet();
@@ -557,7 +567,8 @@ async function viewCSR(view) {
           <div><label class="f">Financial year</label><select class="i" id="imp-fy">${fys.map((f) => `<option>${esc(f)}</option>`).join('')}</select></div>
           <div><label class="f">Region</label><select class="i" id="imp-region">${regions.map((r) => `<option>${esc(r)}</option>`).join('')}</select></div>
           <div><label class="f">Import mode</label><select class="i" id="imp-mode"><option value="merge">Merge / update existing codes</option><option value="replace">Replace entire version</option></select></div>
-          <div><label class="f">CSR file (.xlsx / .csv)</label><input class="i" type="file" id="imp-file" accept=".xlsx,.xlsm,.csv"></div>
+          <div><label class="f">CSR file (.xlsx / .csv / printed .pdf)</label><input class="i" type="file" id="imp-file" accept=".xlsx,.xlsm,.csv,.pdf">
+            <div class="tiny muted">The official PWD CSR as printed — item code, description, unit and the rate columns are read by position, so the whole rate book can be loaded straight from the PDF.</div></div>
         </div>
         <div class="row" style="margin-top:12px">
           <button class="btn" data-act="csr-preview">${ICON.sparkle} Preview &amp; validate</button>
@@ -657,7 +668,7 @@ async function viewProjects(view) {
   const { projects } = await api('/api/projects');
   view.innerHTML = `
     <div class="row between" style="margin-bottom:12px">
-      <div class="muted small">${projects.length} work(s) visible to you · ${S.user.role === 'admin' ? 'all divisions (admin view)' : 'your sub-division'}</div>
+      <div class="muted small">${projects.length} work(s) visible to you · ${esc((S.user && S.user.scope_label) || (S.user.role === 'admin' ? 'all divisions' : 'your post'))}</div>
       <button class="btn pri" data-act="new-project">${ICON.plus} New project</button>
     </div>
     <div class="grid g-auto">
@@ -665,7 +676,7 @@ async function viewProjects(view) {
         <div class="card item-card" style="cursor:pointer" data-act="open-project" data-id="${p.id}">
           <div class="row between"><span class="pill-code">${esc(p.project_code)}</span>${badgeFor(p.status)}</div>
           <div style="font-weight:650">${esc(p.name)}</div>
-          <div class="small muted">${esc(p.division || '')}<br>Engineer: ${esc(p.engineer_name || '—')}</div>
+          <div class="small muted">${esc(p.section ? 'Section ' + p.section : (p.org_name || p.division || ''))}<br>Engineer: ${esc(p.engineer_name || '—')}</div>
           <div class="progress ${p.progress_pct < 35 ? 'warn' : ''}"><i style="width:${Math.min(100, p.progress_pct)}%"></i></div>
           <div class="row between small">
             <span>${p.items} items</span><span><b>${p.progress_pct}%</b> measured</span></div>
@@ -675,8 +686,21 @@ async function viewProjects(view) {
     </div>`;
 }
 
-function newProjectSheet() {
+async function newProjectSheet() {
   const u = S.user || {};
+  await loadOrg();
+  // The CSR version picker is built from what is actually in the Master Database, so an
+  // officer can see at a glance which rate book the work will be mapped against.
+  let versions = [];
+  let orgInfo = { sections: [], subdivisions: [], divisions: [] };
+  try {
+    const [v, o] = await Promise.all([api('/api/csr/versions'), loadOrg()]);
+    versions = (v.versions || []).filter((x) => x.status !== 'archived');
+    orgInfo = o || {};
+  } catch (e) { versions = []; }
+  versions.sort((a, b) => (b.item_count || 0) - (a.item_count || 0) || String(b.fy).localeCompare(String(a.fy)));
+  const best = versions[0] || { fy: '2022-23', region: 'Maharashtra' };
+  const secList = orgInfo.sections || [];
   sheet({
     title: 'New project',
     wide: true,
@@ -684,16 +708,18 @@ function newProjectSheet() {
       <div class="grid g2">
         <div style="grid-column:1/-1"><label class="f">Name of work *</label>
           <input class="i" id="np-name" placeholder="Electrical installation to ... building at ..."></div>
-        <div><label class="f">Scheme / head</label><input class="i" id="np-scheme" placeholder="District Annual Plan 2024-25"></div>
+        <div><label class="f">Scheme / head</label><input class="i" id="np-scheme" placeholder="District Annual Plan 2025-26"></div>
         <div><label class="f">Name of agency</label><input class="i" id="np-agency" placeholder="M/s ..."></div>
-        <div><label class="f">Division</label><input class="i" id="np-div" value="${esc(u.division || '')}"></div>
+        <div><label class="f">Division</label><input class="i" id="np-div" value="${esc(u.org_path ? u.org_path.split(' › ')[0] : (u.division || ''))}"></div>
         <div><label class="f">Circle</label><input class="i" id="np-circle" value="${esc(u.circle || '')}"></div>
-        <div><label class="f">Region <span class="muted tiny">(also picks the CSR version used for mapping)</span></label>
-          <select class="i" id="np-region">${['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option ${(u.region || '') === r ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
-        <div><label class="f">CSR financial year</label>
-          <select class="i" id="np-fy"><option>2025-26</option><option selected>2024-25</option><option>2023-24</option></select></div>
-        <div><label class="f">Estimate No.</label><input class="i" id="np-est" placeholder="EST/ELE/NSK/2024-25/017"></div>
-        <div><label class="f">Technical Sanction No.</label><input class="i" id="np-ts" placeholder="TS/ELE/NSK/2024-25/041"></div>
+        <div><label class="f">Section <span class="muted tiny">(whose measurement book this is)</span></label>
+          <select class="i" id="np-section">${['', ...secList.map((x) => x.name)].map((n) => `<option value="${esc(n)}" ${((u.section || u.org_unit_name || '') === n) ? 'selected' : ''}>${n ? esc(n) : '— division / sub division level —'}</option>`).join('')}</select></div>
+        <div><label class="f">Master CSR version *<span class="muted tiny"> (descriptions &amp; rates come from here)</span></label>
+          <select class="i" id="np-version">${versions.map((v) => `<option value="${esc(v.fy)}|${esc(v.region)}" ${v.fy === best.fy && v.region === best.region ? 'selected' : ''}>${esc(v.fy)} · ${esc(v.region)} — ${inr(v.item_count || 0, 0)} items</option>`).join('') || `<option value="${esc(best.fy)}|${esc(best.region)}">${esc(best.fy)} · ${esc(best.region)}</option>`}</select></div>
+        <div><label class="f">Region / circle of work</label>
+          <select class="i" id="np-region">${['Nashik', 'Pune', 'Mumbai', 'Nagpur', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati', 'Dhule', 'Jalgaon'].map((r) => `<option ${(u.region || '') === r ? 'selected' : ''}>${r}</option>`).join('')}</select></div>
+        <div><label class="f">Estimate No.</label><input class="i" id="np-est" placeholder="EST/ELE/NSK/2025-26/017"></div>
+        <div><label class="f">Technical Sanction No.</label><input class="i" id="np-ts" placeholder="TS/ELE/NSK/2025-26/041"></div>
         <div><label class="f">TS date</label><input class="i" id="np-tsdate" type="date"></div>
         <div><label class="f">TS amount (₹)</label><input class="i" id="np-amt" type="number" placeholder="auto-filled from import"></div>
         <div><label class="f">MB No.</label><input class="i" id="np-mb" value="MB-01"></div>
@@ -707,7 +733,7 @@ Terrace / External | Corridor & External Area"></textarea></div>
     footer: `<button class="btn" data-act="close-sheet">Cancel</button><button class="btn pri" data-act="create-project">Create project</button>`,
   });
 
-  document.querySelector('[data-act="create-project"]').addEventListener('click', async () => {
+  document.querySelector('[data-act="create-project"]')?.addEventListener('click', async () => {
     const val = (id) => (document.getElementById(id) || {}).value || '';
     const name = val('np-name').trim();
     if (name.length < 6) { toast('Please enter a proper name of work', 'bad'); return; }
@@ -715,9 +741,13 @@ Terrace / External | Corridor & External Area"></textarea></div>
       const [a, b] = l.split('|').map((x) => (x || '').trim());
       return b ? { floor: a, name: b } : { floor: '', name: a };
     });
+    const [csrFy, csrRegion] = (val('np-version') || '|').split('|');
+    const sectionName = val('np-section');
+    const sectionUnit = ((S.org && S.org.sections) || []).find((x) => x.name === sectionName);
     const payload = {
       name, scheme: val('np-scheme'), agency: val('np-agency'), division: val('np-div'), circle: val('np-circle'),
-      region: val('np-region'), csr_fy: val('np-fy'), csr_region: val('np-region'),
+      region: val('np-region'), csr_fy: csrFy, csr_region: csrRegion,
+      org_unit_id: sectionUnit ? sectionUnit.id : undefined,
       estimate_no: val('np-est'), ts_no: val('np-ts'), ts_date: val('np-tsdate'),
       ts_amount: Number(val('np-amt') || 0), mb_no: val('np-mb'), agreement_no: val('np-agr'), rooms,
     };
@@ -849,6 +879,7 @@ async function tabOverview(body, p, checklist) {
           <div class="stat-line"><span>Scheme / head</span><span>${esc(pr.scheme || '—')}</span></div>
           <div class="stat-line"><span>Agency</span><span>${esc(pr.agency || '—')}</span></div>
           <div class="stat-line"><span>Division / Circle</span><span>${esc(pr.division || '—')} / ${esc(pr.circle || '—')}</span></div>
+          <div class="stat-line"><span>Section (MB owner)</span><span>${esc(pr.section || pr.org_name || '—')}</span></div>
           <div class="stat-line"><span>Estimate No.</span><span>${esc(pr.estimate_no || '—')}</span></div>
           <div class="stat-line"><span>Technical Sanction</span><span>${esc(pr.ts_no || '—')} · ${dt(pr.ts_date)}</span></div>
           <div class="stat-line"><span>Agreement</span><span>${esc(pr.agreement_no || '—')}</span></div>
@@ -1397,7 +1428,7 @@ function extraItemSheet() {
 /* ------------------------------------------------------------------- admin */
 async function viewAdmin(view) {
   setTitle('Admin Control', 'Master CSR database, users, audit trail and parsing jobs');
-  const [o, jobs] = await Promise.all([api('/api/admin/overview'), api('/api/admin/parse-jobs').catch(() => ({ jobs: [] }))]);
+  const [o, jobs] = await Promise.all([api('/api/admin/overview'), api('/api/admin/parse-jobs').catch(() => ({ jobs: [] })), loadOrg()]);
   const st = o.stats;
   view.innerHTML = `
     <div class="grid g4" style="margin-bottom:14px">
@@ -1480,18 +1511,41 @@ async function viewAdmin(view) {
         <div class="bd small muted">Upload a new financial year from the <a href="#/csr">Master CSR</a> screen (Super Admin panel at the top). Imports are two-step: preview &amp; validate, then commit. Existing item codes are updated, new codes are inserted, malformed rows are reported with the row number.</div>
       </div>`;
   } else if (S.adminTab === 'users') {
+    const org = S.org || { tree: [], sections: [], subdivisions: [], divisions: [], roles: [] };
+    const roleOpts = (sel) => (org.roles.length ? org.roles : [{ id: 'engineer', label: 'Engineer', kind: '' }])
+      .map((r) => `<option value="${esc(r.id)}" ${sel === r.id ? 'selected' : ''}>${esc(r.label)}</option>`).join('');
+    const unitOpts = (sel) => {
+      const out = [];
+      (org.tree || []).forEach((d) => out.push({ u: d, pad: 0 }));
+      (org.tree || []).forEach((d) => (d.children || []).forEach((s2) => out.push({ u: s2, pad: 1 })));
+      (org.tree || []).forEach((d) => (d.children || []).forEach((s2) => (s2.children || []).forEach((x) => out.push({ u: x, pad: 2 }))));
+      return out.map(({ u, pad }) => `<option value="${u.id}" ${sel === u.id ? 'selected' : ''}>${'— '.repeat(pad)}${esc(u.name)}</option>`).join('');
+    };
+    const orgTreeCard = (org.tree || []).map((d) => `
+      <div class="stat-line"><span><span class="badge brand">Division</span> <b>${esc(d.name)}</b></span><span class="muted tiny">${(d.children || []).length} sub-division(s)</span></div>
+      ${(d.children || []).map((s2) => `
+        <div class="stat-line" style="padding-left:18px"><span><span class="badge info">Sub Division</span> ${esc(s2.name)}</span>
+          <span class="tiny muted">${(s2.children || []).map((x) => esc(x.name)).join(' · ')}</span></div>`).join('')}`).join('');
     b.innerHTML = `
       <div class="card" style="margin-bottom:12px">
-        <div class="hd">${ICON.shield}<h3>Create user</h3></div>
+        <div class="hd">${ICON.shield}<h3>The division and its sections</h3></div>
+        <div class="bd stack">
+          ${orgTreeCard || '<div class="empty">No organisation units yet</div>'}
+          <div class="tiny muted">An Executive Engineer sees every work of the division, a Sub Divisional Officer every work of the
+            sub-division, and a Section Officer only their own section's works.</div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <div class="hd">${ICON.plus}<h3>Create user</h3></div>
         <div class="bd">
           <div class="grid g4">
             <div><label class="f">Name</label><input class="i" id="u-name" placeholder="Er. ..."></div>
             <div><label class="f">Email</label><input class="i" id="u-email" placeholder="je.*@pwd.maharashtra.gov.in"></div>
-            <div><label class="f">Role</label><select class="i" id="u-role"><option value="engineer">Site Engineer</option><option value="admin">Super Admin</option></select></div>
+            <div><label class="f">Role</label><select class="i" id="u-role">${roleOpts('section')}</select></div>
             <div><label class="f">Designation</label><input class="i" id="u-desig" value="Junior Engineer (Electrical)"></div>
-            <div><label class="f">Division</label><input class="i" id="u-div" placeholder="PWD Electrical Sub-Division, ..."></div>
+            <div><label class="f">Posting (division / sub division / section)</label><select class="i" id="u-unit">${unitOpts(null)}</select></div>
             <div><label class="f">Circle</label><input class="i" id="u-circle" placeholder="... Circle"></div>
-            <div><label class="f">Region</label><select class="i" id="u-region">${['Pune', 'Mumbai', 'Nagpur', 'Nashik', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option>${r}</option>`).join('')}</select></div>
+            <div><label class="f">Region</label><select class="i" id="u-region">${['Nashik', 'Dhule', 'Jalgaon', 'Pune', 'Mumbai', 'Nagpur', 'Chhatrapati Sambhajinagar', 'Konkan', 'Amravati'].map((r) => `<option>${r}</option>`).join('')}</select></div>
             <div><label class="f">Temp. password</label><input class="i" id="u-pass" value="Welcome@123"></div>
           </div>
           <div class="row" style="margin-top:12px"><button class="btn pri" data-act="create-user">${ICON.plus} Create account</button></div>
@@ -1500,16 +1554,17 @@ async function viewAdmin(view) {
       <div class="card">
         <div class="hd"><h3>Users (${o.users.length})</h3></div>
         <div class="bd tight scrollx">
-          <table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Division / circle</th><th>Region</th><th>Last login</th><th>Status</th><th></th></tr></thead>
+          <table class="tbl"><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Posting</th><th>Sees</th><th>Last login</th><th>Status</th><th></th></tr></thead>
           <tbody>${o.users.map((u) => `<tr>
             <td><b>${esc(u.name)}</b><div class="tiny muted">${esc(u.designation || '')}</div></td>
             <td class="small">${esc(u.email)}</td>
-            <td>${u.role === 'admin' ? '<span class="badge brand">Super Admin</span>' : '<span class="badge">Site Engineer</span>'}</td>
-            <td class="small">${esc(u.division || '—')}<div class="tiny muted">${esc(u.circle || '')}</div></td>
-            <td class="small">${esc(u.region || '—')}</td>
+            <td>${u.role === 'admin' ? '<span class="badge brand">Super Admin</span>' : `<span class="badge">${esc(u.role_label || u.role)}</span>`}</td>
+            <td class="small">${esc(u.org_path || u.division || '—')}<div class="tiny muted">${esc(u.circle || '')} ${esc(u.region ? '· ' + u.region : '')}</div></td>
+            <td class="tiny muted">${esc(u.scope_label || '—')}</td>
             <td class="small">${u.last_login ? dtt(u.last_login) : '—'}</td>
             <td>${u.is_active ? '<span class="badge ok">Active</span>' : '<span class="badge bad">Disabled</span>'}</td>
-            <td class="nowrap"><button class="btn sm" data-act="toggle-user" data-id="${u.id}" data-v="${u.is_active ? 0 : 1}">${u.is_active ? 'Disable' : 'Enable'}</button>
+            <td class="nowrap"><button class="btn sm" data-act="post-user" data-id="${u.id}" data-unit="${u.org_unit_id || ''}">Change posting</button>
+              <button class="btn sm" data-act="toggle-user" data-id="${u.id}" data-v="${u.is_active ? 0 : 1}">${u.is_active ? 'Disable' : 'Enable'}</button>
               <button class="btn sm" data-act="reset-pass" data-id="${u.id}">Reset password</button>
               <button class="btn sm danger" data-act="del-user" data-id="${u.id}" data-name="${esc(u.name)}">Delete</button></td>
           </tr>`).join('')}</tbody></table>
@@ -1840,13 +1895,41 @@ document.addEventListener('click', async (e) => {
     catch (err) { toast(err.message, 'bad'); }
     return;
   }
+  if (act === 'post-user') {
+    const id = t.dataset.id;
+    const org = S.org || { tree: [] };
+    const opts = [];
+    (org.tree || []).forEach((d) => { opts.push({ u: d, pad: 0 });
+      (d.children || []).forEach((s2) => { opts.push({ u: s2, pad: 1 });
+        (s2.children || []).forEach((x) => opts.push({ u: x, pad: 2 })); }); });
+    const cur = t.dataset.unit || '';
+    sheet({
+      title: 'Change posting',
+      body: `<div class="stack">
+        <label class="f">Where is this officer posted?</label>
+        <select class="i" id="pu-unit">${opts.map(({ u, pad }) => `<option value="${u.id}" ${String(u.id) === String(cur) ? 'selected' : ''}>${'— '.repeat(pad)}${esc(u.name)} (${esc(u.kind)})</option>`).join('')}</select>
+        <div class="tiny muted">Saving re-scopes what this officer can see: their own post, everything below it, and their own projects.</div>
+      </div>`,
+      footer: `<button class="btn" data-act="close-sheet">Cancel</button><button class="btn pri" data-act="save-posting" data-id="${id}">Save posting</button>`,
+    });
+    return;
+  }
+  if (act === 'save-posting') {
+    const unit = Number((document.getElementById('pu-unit') || {}).value) || null;
+    try {
+      await api(`/api/admin/users/${t.dataset.id}`, { method: 'PATCH', body: { org_unit_id: unit } });
+      toast('Posting updated', 'ok'); closeSheet(); render();
+    } catch (err) { toast(err.message, 'bad'); }
+    return;
+  }
   if (act === 'create-user') {
     const g = (x) => (document.getElementById(x) || {}).value || '';
     try {
       const r = await api('/api/admin/users', {
         method: 'POST', body: {
           name: g('u-name'), email: g('u-email'), role: g('u-role'), designation: g('u-desig'),
-          division: g('u-div'), circle: g('u-circle'), region: g('u-region'), password: g('u-pass'),
+          org_unit_id: Number(g('u-unit')) || null, circle: g('u-circle'), region: g('u-region'),
+          password: g('u-pass'),
         }
       });
       toast(`Account created. Temporary password: ${r.default_password}`, 'ok', 6000); render();

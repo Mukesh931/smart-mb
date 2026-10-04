@@ -70,7 +70,8 @@ globalThis.__T = { S, DEMO, render, viewDashboard, viewCSR, viewProjects, viewPr
   queueable, outboxFlush, paintOutboxBadge, outboxSize: () => S.outbox.length, outboxLast: () => S.outbox[S.outbox.length - 1],
   isOnline,
   tabChecklist, tabMeasurements, tabDeviations, tabOverview, renderLogin, badgeFor,
-  tabVerify, svRoomSheet, svLinkSheet, svImportPanel, svRenderPreview, svChip, svRowHTML };
+  tabVerify, svRoomSheet, svLinkSheet, svImportPanel, svRenderPreview, svChip, svRowHTML,
+  newProjectSheet, loadOrg };
 `;
 const errors = [];
 process.on('unhandledRejection', (e) => errors.push('unhandled rejection: ' + (e && e.message)));
@@ -306,15 +307,37 @@ await step('extra-item search sheet opens', () => {
   return expect(lastSheet(), 'Add extra / additional item from Master CSR', 'sheet title');
 });
 
+await step('new-project sheet asks for the CSR version and the section', async () => {
+  const el = makeEl('np-sheet');
+  T.S.user = { ...(T.S.user || {}), role: 'admin', name: 'Test', email: 'a@b.c' };
+  await T.newProjectSheet();
+  const html = T.S.lastSheet || '';
+  return expect(html, 'Master CSR version', 'CSR version picker') +
+         expect(html, 'Section', 'section picker') +
+         expect(html, 'Rooms / locations', 'rooms box');
+});
+
 await step('admin panel renders (all four tabs)', async () => {
   let out = '';
-  for (const tab of ['master', 'users', 'audit', 'jobs']) {
+  let bodies = {};
+  for (const tab of ['master', 'users', 'audit', 'jobs', 'data']) {
     T.S.adminTab = tab;
     const el = makeEl('v-admin-' + tab);
     await T.viewAdmin(el);
     out += el.innerHTML;
+    const bodyEl = document.getElementById('adminbody');
+    bodies[tab] = bodyEl ? bodyEl.innerHTML : '(no adminbody node)';   // the tab body itself
   }
-  return expect(expect(out, 'Master CSR versions', 'versions tab') && out, 'Audit trail', 'audit tab');
+  if (!/Master CSR versions/.test(out) || !/Audit trail/.test(out)) throw new Error('tab strip missing');
+  if (!/CSR versions in the Master Database/i.test(bodies.master))
+    throw new Error('the master tab body did not render');
+  if (!/Audit trail — every master change/.test(bodies.audit)) throw new Error('the audit tab body did not render');
+  if (!/Backups/.test(bodies.data)) throw new Error('the data-safety tab body did not render');
+  for (const needle of ['PWD Electrical Division Dhule', 'Jalgaon-1', 'Jalgaon-2', 'Amalner',
+                        'Posting', 'Change posting']) {
+    if (!bodies.users.includes(needle)) throw new Error('the users tab is missing ' + needle);
+  }
+  return `${bodies.users.length} chars of users tab · division tree, sections and postings present`;
 });
 
 await step('offline guard: read-only writes are blocked with a clear message', async () => {

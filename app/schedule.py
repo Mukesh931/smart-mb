@@ -133,6 +133,38 @@ def coverage_score(label: str, hay: str, idf: dict[str, float], unit: str = "") 
     return round(score, 3)
 
 
+# A schedule column ("Ceiling Fan 1200 mm") asks for work to be *done*; a CSR row that
+# only dismantles, rewinds, recesses or merely erects a departmentally supplied item
+# mentions the same nouns but is the wrong row.  These intent rules are what keeps the
+# auto-match honest - no model, just the wording the printed CSR actually uses.
+_INTENT_PENALTY = [
+    (r"\b(dismantl|removal of|credit for dismantled)", 0.45),
+    (r"\brewinding\b|\brewind\b|\brepair\b|\breplacement of\b", 0.55),
+    (r"\bproviding recess|recess in (stone|brick|concrete)", 0.55),
+    (r"\berection of departmentally supplied|erecting the departmentally supplied|"
+     r"\bsupplied by department\b|departmentally supplied", 0.65),
+    (r"\btesting and charging|\btesting,? only\b", 0.7),
+]
+_INTENT_BONUS = [
+    (r"^\s*supplying?\b", 1.06),
+    (r"\bsupplying and (erecting|fixing|installing|laying)", 1.04),
+]
+
+
+def intent_factor(label: str, hay: str) -> float:
+    """Multiplier that pushes a candidate towards the row that actually does the work."""
+    label = (label or "").lower()
+    hay_l = (hay or "").lower()
+    factor = 1.0
+    for pat, mul in _INTENT_PENALTY:
+        if re.search(pat, hay_l) and not re.search(pat, label):
+            factor *= mul
+    for pat, mul in _INTENT_BONUS:
+        if re.search(pat, hay_l):
+            factor *= mul
+    return round(factor, 4)
+
+
 def similarity(a: str, b: str) -> float:
     """Token-overlap similarity (0..1) with partial-credit for contained phrases."""
     ta, tb = _tokens(a), _tokens(b)
@@ -623,6 +655,7 @@ def map_columns(columns: Iterable[dict], project_items: list[dict], master_items
         scored = []
         for kind, obj, text in cands:
             score = coverage_score(label, text, idf, obj.get("unit") or "")
+            score = round(min(1.0, score * intent_factor(label, text)), 3)
             ht = _tokens(text)
             dice = (2 * len(lt & ht) / (len(lt) + len(ht))) if lt and ht else 0.0
             scored.append((score, round(dice, 4), 0 if kind == "project_item" else 1, kind, obj))
