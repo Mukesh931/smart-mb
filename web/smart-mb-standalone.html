@@ -1087,7 +1087,7 @@ async function viewProject(view, id) {
           <div class="kpi" style="padding:8px 0"><div class="lbl">Checklist items</div><div class="val sm">${p.items}</div>
             <div class="foot">${p.items_measured} measured · ${p.items_pending} pending</div></div>
           <div class="kpi" style="padding:8px 0"><div class="lbl">Tendered (estimate)</div><div class="val sm">₹ ${inr(p.tendered_amount, 0)}</div>
-            <div class="foot">${p.rooms} rooms · ${p.photos} site photos</div></div>
+            <div class="foot">${Array.isArray(p.rooms) ? p.rooms.length : (p.rooms || 0)} rooms · ${Array.isArray(p.photos) ? p.photos.length : (p.photos || 0)} site photos</div></div>
           <div class="kpi" style="padding:8px 0"><div class="lbl">Measured value</div><div class="val sm">₹ ${inr(p.measured_amount, 0)}</div>
             <div class="foot">${p.measurement_rows} measurement rows</div></div>
           <div class="kpi" style="padding:8px 0"><div class="lbl">Net deviation</div>

@@ -146,8 +146,11 @@ await step('project detail renders (overview tab)', async () => {
   await T.viewProject(el, T.S.proj.id);
   await new Promise((r) => setTimeout(r, 60));
   const head = document.getElementById('tabbody').innerHTML;
-  return expect(expect(el.innerHTML, 'Form-23 MB (PDF)', 'MB action') && el.innerHTML + head,
-    'Work particulars', 'particulars');
+  const all = el.innerHTML + head;
+  if (!expect(all, 'Descriptive schedule', 'step-2 upload card on the overview')) return false;
+  if (!expect(all, 'goto-schedule', 'jump-to-upload button')) return false;
+  if (all.includes('[object Object]')) throw new Error('overview interpolates an object: [object Object]');
+  return expect(expect(el.innerHTML, 'Form-23 MB (PDF)', 'MB action') && all, 'Work particulars', 'particulars');
 });
 
 for (const [tab, needle] of [['import', 'Reconciliation'],
