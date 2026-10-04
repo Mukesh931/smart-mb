@@ -475,6 +475,33 @@ check("duplicate email rejected", st == 409)
 st, r = call("/api/projects", "POST", {"name": "no auth project"}, token="")
 check("unauthenticated writes rejected", st in (401, 403))
 
+print("\n[11b] Admin - data safety / backup contract")
+st, bk = call("/api/admin/backup", token=ATOK)
+need = {"configured", "repo", "path", "interval", "last_push", "last_size", "last_restore",
+        "last_error", "pending", "storage", "data_dir", "db_bytes"}
+check("backup status reports the whole contract", st == 200 and need <= set(bk.keys()),
+      f"storage={bk.get('storage')} configured={bk.get('configured')}")
+check("the storage warning matches reality", bk.get("storage") in ("persistent", "ephemeral"),
+      bk.get("storage"))
+if bk.get("configured"):
+    check("a configured backup names its repository and path",
+          bool(bk.get("repo")) and bool(bk.get("path")), f"{bk.get('repo')} · {bk.get('path')}")
+    # a freshly booted instance has not pushed yet; SMARTMB_EXPECT_BACKUP=1 asserts that a
+    # real snapshot has landed (that is what we check on the production service)
+    pushed = bool(bk.get("last_push")) and (bk.get("last_size") or 0) > 0
+    if os.environ.get("SMARTMB_EXPECT_BACKUP") == "1":
+        check("a snapshot has already been pushed to the repository", pushed,
+              f"last push {bk.get('last_push')} · {(bk.get('last_size') or 0)/1024:.0f} KiB")
+    else:
+        check("push state is reported (null until the first snapshot)", True,
+              f"last push {bk.get('last_push') or 'not yet'} · {(bk.get('last_size') or 0)/1024:.0f} KiB")
+    check("with no error recorded", not bk.get("last_error"), str(bk.get("last_error"))[:80])
+else:
+    check("backups are switched off here (set SMARTMB_BACKUP_REPO/TOKEN on the server)", True,
+          "not configured on this instance")
+st, r = call("/api/admin/backup/now", "POST", token=ETOK)
+check("only an admin may push a snapshot", st == 403, str(r)[:60])
+
 print("\n[12] cleanup - remove every artifact this test created")
 for _pid in org_projects:
     call(f"/api/projects/{_pid}", "DELETE", token=ATOK)

@@ -62,12 +62,41 @@ def status(enabled_only: bool = False) -> dict:
 
 # ------------------------------------------------------------------ snapshots
 def make_archive() -> bytes:
+    """A consistent snapshot of the whole data directory.
+
+    The database is copied with SQLite's *online backup* API rather than by reading the
+    file: the app runs in WAL mode, so the newest measurements can still be sitting in
+    `smartmb.sqlite3-wal` and a plain file copy would silently lose them.  The copy is
+    taken under the same lock the writer uses, so it is a valid database at one instant.
+    """
+    import sqlite3
+    import tempfile
+
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name in ("smartmb.sqlite3", "uploads", "photos"):
-            full = os.path.join(DATA_DIR, name)
-            if os.path.exists(full):
-                tar.add(full, arcname=name)
+    db_copy = None
+    try:
+        if os.path.exists(DB_PATH):
+            fd, db_copy = tempfile.mkstemp(suffix=".sqlite3", prefix="smartmb-snap-")
+            os.close(fd)
+            src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30)
+            try:
+                dest = sqlite3.connect(db_copy)
+                try:
+                    src.backup(dest)              # atomic, WAL-aware, safe while serving
+                finally:
+                    dest.close()
+            finally:
+                src.close()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            if db_copy and os.path.getsize(db_copy) > 0:
+                tar.add(db_copy, arcname="smartmb.sqlite3")
+            for name in ("uploads", "photos"):
+                full = os.path.join(DATA_DIR, name)
+                if os.path.exists(full):
+                    tar.add(full, arcname=name)
+    finally:
+        if db_copy and os.path.exists(db_copy):
+            os.unlink(db_copy)
     return buf.getvalue()
 
 
@@ -81,6 +110,12 @@ def unpack_archive(blob: bytes) -> dict:
             if ".." in m.name or m.name.startswith("/"):
                 continue
             tar.extract(m, path=DATA_DIR, filter="data")
+            # a restored database must not sit behind a stale write-ahead log
+            if m.name == "smartmb.sqlite3":
+                for suffix in ("-wal", "-shm"):
+                    stale = DB_PATH + suffix
+                    if os.path.exists(stale):
+                        os.unlink(stale)
             if m.name == "smartmb.sqlite3":
                 restored["db"] = True
             elif m.isfile():
@@ -130,22 +165,50 @@ def _download() -> bytes | None:
 
 
 def _upload(blob: bytes, message: str) -> dict:
-    """Push the snapshot with the Git Data API (works for files well over 1 MB)."""
-    ref = _req("GET", f"{API}/repos/{REPO}/git/ref/heads/main")["object"]["sha"]
-    base = _req("GET", f"{API}/repos/{REPO}/git/commits/{ref}")["tree"]["sha"]
-    parts = SNAP_PATH.split("/")
-    # blobs → tree for the snapshot's folder, grafted onto the existing root tree
+    """Push the snapshot with the Git Data API (works for files well over 1 MB).
+
+    GitHub's tree API refuses inline `content` for a *subdirectory* entry ("A subdirectory
+    may not have content"), so the folders are built bottom-up - a blob, then a tree per
+    directory level, each referenced by sha - and finally grafted onto the existing root
+    tree.  A repository created seconds ago has no `main` ref, so the first snapshot
+    creates the branch instead of failing.
+    """
+    first_commit = False
+    try:
+        ref = _req("GET", f"{API}/repos/{REPO}/git/ref/heads/main")["object"]["sha"]
+        base = _req("GET", f"{API}/repos/{REPO}/git/commits/{ref}")["tree"]["sha"]
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 409, 422):
+            raise
+        ref, base, first_commit = None, None, True
+
     blob_sha = _req("POST", f"{API}/repos/{REPO}/git/blobs",
                     {"content": base64.b64encode(blob).decode(), "encoding": "base64"})["sha"]
-    tree: dict = {"path": SNAP_PATH, "mode": "100644", "type": "blob", "sha": blob_sha}
-    for i in range(len(parts) - 1, 0, -1):
-        tree = {"path": parts[i - 1], "mode": "040000", "type": "tree", "content": [tree]}
-    new_tree = _req("POST", f"{API}/repos/{REPO}/git/trees",
-                    {"base_tree": base, "tree": [tree]})["sha"]
-    commit = _req("POST", f"{API}/repos/{REPO}/git/commits",
-                  {"message": message, "tree": new_tree, "parents": [ref]})["sha"]
-    _req("PATCH", f"{API}/repos/{REPO}/git/refs/heads/main", {"sha": commit, "force": True})
-    return {"commit": commit, "bytes": len(blob)}
+
+    parts = SNAP_PATH.strip("/").split("/")
+    # deepest level first: the file, then one tree per directory
+    entry: dict = {"path": parts[-1], "mode": "100644", "type": "blob", "sha": blob_sha}
+    for name in reversed(parts[:-1]):
+        sha = _req("POST", f"{API}/repos/{REPO}/git/trees", {"tree": [entry]})["sha"]
+        entry = {"path": name, "mode": "040000", "type": "tree", "sha": sha}
+
+    tree_body: dict = {"tree": [entry]}
+    if base:                                       # keep whatever else the repo holds
+        tree_body["base_tree"] = base
+    new_tree = _req("POST", f"{API}/repos/{REPO}/git/trees", tree_body)["sha"]
+
+    commit_body: dict = {"message": message, "tree": new_tree}
+    if ref:
+        commit_body["parents"] = [ref]
+    commit = _req("POST", f"{API}/repos/{REPO}/git/commits", commit_body)["sha"]
+
+    try:
+        _req("PATCH", f"{API}/repos/{REPO}/git/refs/heads/main", {"sha": commit, "force": True})
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404, 422):             # the branch does not exist yet
+            raise
+        _req("POST", f"{API}/repos/{REPO}/git/refs", {"ref": "refs/heads/main", "sha": commit})
+    return {"commit": commit, "bytes": len(blob), "first_commit": first_commit}
 
 
 def snapshot_now(reason: str = "manual") -> dict:
