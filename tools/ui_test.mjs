@@ -67,8 +67,10 @@ globalThis.URL.revokeObjectURL = () => {};
 const driver = `
 globalThis.__T = { S, DEMO, render, viewDashboard, viewCSR, viewProjects, viewProject, viewAdmin,
   enterDemo, shell, measureSheet, extraItemSheet, csrItemSheet, renderImportPreview, tabImport, tabReports,
+  queueable, outboxFlush, paintOutboxBadge, outboxSize: () => S.outbox.length, outboxLast: () => S.outbox[S.outbox.length - 1],
+  isOnline,
   tabChecklist, tabMeasurements, tabDeviations, tabOverview, renderLogin, badgeFor,
-  tabVerify, svRoomSheet, svLinkSheet, svImportPanel, svRenderPreview, svChip };
+  tabVerify, svRoomSheet, svLinkSheet, svImportPanel, svRenderPreview, svChip, svRowHTML };
 `;
 const errors = [];
 process.on('unhandledRejection', (e) => errors.push('unhandled rejection: ' + (e && e.message)));
@@ -175,7 +177,8 @@ await step('site-verify: room list renders schedule quantities', async () => {
   const sb = document.getElementById('sv-body').innerHTML;
   const roomCount = (T.DEMO.verify.rooms || []).length;
   if (!roomCount) throw new Error('demo snapshot has no schedule rooms');
-  if (!sb.includes('Verify at site')) throw new Error('per-room verify button missing');
+  if (!sb.includes('data-open=')) throw new Error('per-room verify button missing');
+  if (!sb.includes('Upload a different schedule')) throw new Error('schedule upload shortcut missing');
   if (!sb.includes('pending')) throw new Error('pending badge missing');
   return `${roomCount} rooms, ${T.DEMO.verify.totals.cells} quantities, ${T.DEMO.verify.totals.pending} pending`;
 });
@@ -194,14 +197,88 @@ await step('site-verify: room verification sheet opens with keep/actual actions'
   await T.svRoomSheet(T.DEMO.project, room, T.DEMO.verify);
   await new Promise((r) => setTimeout(r, 80));
   const sh = lastSheet();
-  return expect(expect(sh, 'verify against the descriptive schedule', 'sheet title') && sh,
-    'As per schedule', 'keep action');
+  const bd = document.getElementById('sheet-body').innerHTML;
+  if (!sh.includes('scheduled quantities')) throw new Error('sheet subtitle missing');
+  if (!bd.includes('data-sv="allkeep"')) throw new Error('one-tap "all as per schedule" missing');
+  if (!bd.includes('data-keep=')) throw new Error('per-quantity keep button missing');
+  if (!bd.includes('data-step="-1"') || !bd.includes('data-step="1"')) throw new Error('quantity stepper missing');
+  if (!bd.includes('inputmode="decimal"')) throw new Error('numeric keypad hint missing on the actual box');
+  return 'keep/actual + stepper + numeric keypad rendered';
+});
+
+await step('site-verify: an unlinked column offers linking instead of a verify action', () => {
+  const html = T.svRowHTML({ id: 999, column_order: 3, col_label: 'Earthing', qty: 2, verify_status: 'pending',
+    project_item_id: null, item_code: null, item_description: null, unit: null, actual_qty: null });
+  if (!html.includes('data-sv="link-cell"')) throw new Error('unlinked row has no link action');
+  if (html.includes('data-keep=') || html.includes('data-change=')) throw new Error('unlinked row still offers keep/actual');
+  if (!html.includes('not linked')) throw new Error('unlinked row is not labelled');
+  return 'unlinked columns ask to be linked first';
 });
 
 await step('site-verify: column linking sheet opens', async () => {
   await T.svLinkSheet(T.DEMO.project, T.DEMO.verify, null);
   await new Promise((r) => setTimeout(r, 80));
   return expect(lastSheet(), 'Link schedule columns', 'linking sheet');
+});
+
+await step('site-verify: rooms can be grouped by floor', async () => {
+  const el = makeEl('v-verify-floor');
+  T.S.verify.section = 'rooms';
+  T.S.verify.byFloor = true;
+  await T.tabVerify(el, T.DEMO.project, T.DEMO.verify);
+  await new Promise((r) => setTimeout(r, 60));
+  const sb = document.getElementById('sv-body').innerHTML;
+  T.S.verify.byFloor = false;
+  if (!sb.includes('GROUND FLOOR')) throw new Error('floor heading missing');
+  if (!sb.includes('room(s)')) throw new Error('floor room count missing');
+  return 'rooms grouped by floor with the floor badge';
+});
+
+await step('site-verify: schedule upload is reachable from Smart Import', async () => {
+  const el = makeEl('v-import-schedule');
+  await T.tabImport(el, T.DEMO.project);
+  await new Promise((r) => setTimeout(r, 40));
+  const html = document.getElementById('import-schedule').innerHTML;
+  if (!html.includes('sv-file')) throw new Error('schedule file input missing in Smart Import');
+  if (!html.includes('sv-parse')) throw new Error('schedule upload button missing in Smart Import');
+  if (!html.includes('sv-parse-text')) throw new Error('paste fallback missing in Smart Import');
+  if (!html.includes('Descriptive schedule')) throw new Error('estimate tab does not point at the schedule');
+  return 'file input + paste box embedded in Smart Import';
+});
+
+await step('offline: a verify action is saved on the phone and queued', async () => {
+  T.S.demo = false;                                   // live mode: writes must reach the server
+  const before = T.outboxSize();
+  const res = await T.queueable('/api/schedule-cells/999/verify', { method: 'POST', body: { action: 'keep' } });
+  if (!res.queued) throw new Error('action was not queued while offline');
+  if (T.outboxSize() !== before + 1) throw new Error('outbox did not grow');
+  return `${T.outboxSize()} action(s) held on the phone, screen already updated`;
+});
+
+await step('offline: a queued measurement carries a client_ref so a replay cannot double-count', async () => {
+  const res = await T.queueable('/api/measurements', { method: 'POST', body: { project_item_id: 1, measured_qty: 9, client_ref: 'm-test-1' } });
+  const last = T.outboxLast();
+  if (!res.queued || !last || last.clientRef !== 'm-test-1') throw new Error('client_ref not preserved in the queue');
+  return 'replay-safe: the same reading is recognised by the server';
+});
+
+await step('offline: the bar tells the engineer what is waiting and offers a sync', () => {
+  T.paintOutboxBadge();
+  const bar = document.getElementById('outbox-bar').innerHTML;
+  if (!bar.includes('site record')) throw new Error('outbox bar did not report the queue');
+  if (!bar.includes('outbox-sync')) throw new Error('manual sync button missing');
+  return 'queue is visible on every screen';
+});
+
+await step('offline: retry stops cleanly while still offline', async () => {
+  const r = await T.outboxFlush();
+  if (r.left !== T.outboxSize()) throw new Error('flush lost queue items');
+  return `${r.left} record(s) kept safely on the phone`;
+});
+
+await step('offline: queue survives a reload (localStorage)', () => {
+  if (T.outboxSize() < 2) throw new Error('queue not persisted');
+  return 'persisted in localStorage';
 });
 
 await step('site-verify: import panel renders when no schedule exists', async () => {

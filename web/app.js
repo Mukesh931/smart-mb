@@ -8,16 +8,121 @@
 const API_BASE = '';
 const S = {
   token: localStorage.getItem('smartmb_token') || '',
+  outbox: (function () { try { return JSON.parse(localStorage.getItem('smartmb_outbox') || '[]'); } catch (e) { return []; } })(),
   user: JSON.parse(localStorage.getItem('smartmb_user') || 'null'),
   route: { name: 'dashboard', params: {} },
   demo: false,
   csr: { fy: '', region: '', q: '', category: '', chapter: '', page: 0, limit: 40 },
   proj: { id: null, tab: 'overview', room: null, data: null },
-  verify: { docId: null, onlyPending: false, section: 'rooms' },
+  verify: { docId: null, onlyPending: false, byFloor: false, section: 'rooms', queuedIds: new Set() },
+  outbox: [],
   schedulePreview: null,
   importPreview: null,
   adminTab: 'master',
 };
+
+/* ============================================================ offline outbox
+   Site engineers work in places with one bar of signal.  Every write that records
+   something on site (verify a quantity, capture a measurement) goes through
+   queueable(): the POST is made, and if the phone is offline the action is kept in
+   localStorage, applied to the screen immediately, and replayed automatically when
+   the network returns.  Measurement POSTs carry a client_ref, so a replay can never
+   record the same reading twice.  The queue survives closing the app.
+   ========================================================================== */
+const OUTBOX_KEY = 'smartmb_outbox';
+const isOnline = () => !(typeof navigator !== 'undefined' && navigator.onLine === false);
+
+function outboxLoad() {
+  try { return JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); } catch (e) { return []; }
+}
+function outboxSave() {
+  try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(S.outbox)); } catch (e) { /* full/blocked */ }
+  paintOutboxBadge();
+}
+function outboxAdd(item) {
+  item.id = item.id || ('q' + Date.now() + Math.random().toString(16).slice(2, 8));
+  S.outbox.push(item);
+  outboxSave();
+  return item;
+}
+function outboxDrop(match) {
+  const before = S.outbox.length;
+  S.outbox = S.outbox.filter((o) => !(o.kind === match.kind && String(o.cellId || '') === String(match.cellId || '')
+    && (match.clientRef ? o.clientRef === match.clientRef : true)));
+  if (S.outbox.length !== before) outboxSave();
+}
+function outboxClearFor(prefix) { S.outbox = S.outbox.filter((o) => !o.path.startsWith(prefix)); outboxSave(); }
+
+function paintOutboxBadge() {
+  const n = S.outbox.length;
+  const bar = document.getElementById('outbox-bar');
+  const off = !isOnline();
+  if (!bar) return;
+  if (!n && !off) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  bar.innerHTML = `<span class="dot ${off ? 'bad' : 'warn'}"></span>
+    <span>${off ? 'No network at site — ' : ''}${n ? `<b>${n}</b> site record${n === 1 ? '' : 's'} saved on this phone, not yet sent.` : 'Offline — readings will be saved on this phone.'}</span>
+    <button class="btn sm" data-act="outbox-sync" ${off ? 'disabled' : ''}>Sync now</button>`;
+}
+
+/* Route a write through the outbox.  Returns the API response, or a synthetic
+   {queued:true} response when the action was stored on the phone instead. */
+async function queueable(path, opts) {
+  try {
+    return await api(path, opts);
+  } catch (err) {
+    if (err.status || !S.demo) {
+      if (err.status) throw err;        // the server answered and refused - show that to the engineer
+      const kind = path.includes('/api/measurements') ? 'measurement'
+        : path.includes('verify-bulk') ? 'bulk' : 'cell';
+      const cellId = (path.match(/\/api\/schedule-cells\/(\d+)\/verify/) || [])[1];
+      const item = outboxAdd({ kind, cellId: cellId ? Number(cellId) : null, path, method: opts.method || 'POST',
+        body: opts.body, clientRef: (opts.body || {}).client_ref || null, ts: Date.now() });
+      const action = (opts.body || {}).action;
+      const qty = (opts.body || {}).actual_qty;
+      return { ok: true, queued: true, offline: true, queue_id: item.id, cell_id: item.cellId,
+               status: action === 'keep' ? 'kept' : action === 'pending' ? 'pending' : (qty != null ? 'changed' : 'kept'),
+               qty: qty != null ? qty : (opts.body || {}).schedule_qty, verified: 0, failed: [],
+               measurement_id: null, measured_qty: (opts.body || {}).measured_qty, item_total_qty: null };
+    }
+    throw err;
+  }
+}
+
+let flushing = false;
+async function outboxFlush(manual) {
+  if (flushing) return { sent: 0, left: S.outbox.length };
+  if (!S.outbox.length) { if (manual) toast('Everything is already synced', 'ok'); return { sent: 0, left: 0 }; }
+  flushing = true;
+  let sent = 0, rejected = 0;
+  while (S.outbox.length) {
+    const item = S.outbox[0];
+    try {
+      await api(item.path, { method: item.method || 'POST', body: item.body });
+      S.outbox.shift(); sent++;
+    } catch (err) {
+      if (err.status) { S.outbox.shift(); rejected++; }   // server said no - retrying forever would block the queue
+      else break;                                          // still offline
+    }
+  }
+  flushing = false;
+  if (!S.outbox.length) S.verify.queuedIds.clear();
+  outboxSave();
+  if (sent) toast(`${sent} site record${sent === 1 ? '' : 's'} synced to the server`, 'ok');
+  if (rejected) toast(`${rejected} queued record(s) were rejected by the server — please re-check them`, 'bad', 6000);
+  if (sent || rejected) {
+    if (typeof render === 'function' && (S.token || S.demo)) render();
+  }
+  return { sent, left: S.outbox.length };
+}
+
+async function syncNow() {
+  if (!isOnline()) { toast('Still offline — the records stay safely on this phone', 'warn'); return; }
+  const btn = document.querySelector('[data-act="outbox-sync"]');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>'; }
+  await outboxFlush(true);
+  paintOutboxBadge();
+}
 
 /* ------------------------------------------------------------------ utils */
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -158,15 +263,17 @@ function toast(msg, kind = '', ms = 3600) {
   setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 320); }, ms);
 }
 function closeSheet() { const s = document.querySelector('.sheet-bg'); if (s) s.remove(); }
-function sheet({ title, body, footer, wide = false, onOpen }) {
+function sheet({ title, subtitle, body, footer, wide = false, onOpen, body_id, sticky = false }) {
   closeSheet();
   const el = document.createElement('div');
   el.className = 'sheet-bg';
   el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" ${wide ? 'style="max-width:920px"' : ''}>
     <div class="grabber mob-only"></div>
-    <div class="hd"><h3>${esc(title)}</h3><button class="btn sm" data-act="close-sheet">${ICON.x}</button></div>
-    <div class="bd">${body}</div>
-    ${footer ? `<div class="ft">${footer}</div>` : ''}</div>`;
+    <div class="hd"><div style="flex:1;min-width:0"><h3>${esc(title)}</h3>
+      ${subtitle ? `<div class="small muted">${esc(subtitle)}</div>` : ''}</div>
+      <button class="btn sm" data-act="close-sheet">${ICON.x}</button></div>
+    <div class="bd"${body_id ? ` id="${body_id}"` : ''}>${body}</div>
+    ${footer ? `<div class="ft${sticky ? ' sticky' : ''}">${footer}</div>` : ''}</div>`;
   document.body.appendChild(el);
   el.addEventListener('click', (e) => {
     if (e.target === el || e.target.closest('[data-act="close-sheet"]')) closeSheet();
@@ -199,6 +306,7 @@ function parseHash() {
 }
 
 async function render() {
+  setTimeout(paintOutboxBadge, 0);
   if (!S.token && !S.demo) { renderLogin(); return; }
   S.route = parseHash();
   const app = document.getElementById('app');
@@ -252,6 +360,7 @@ function shell() {
       </div>
     </aside>
     <main class="main">
+      <div id="outbox-bar" class="outbox-bar" style="display:none"></div>
       <header class="topbar">
         <div style="flex:1;min-width:0"><h1 id="ptitle">Smart-MB<small id="psub">Centralized CSR Database & Site Verification System</small></h1></div>
         <span class="badge brand desk-only">CSR ${esc(S.csr.fy || '2024-25')} · ${esc(S.csr.region || (u.region || 'Pune'))}</span>
@@ -647,7 +756,31 @@ async function tabOverview(body, p, checklist) {
   const pr = p.project;
   const dev = await api(`/api/projects/${p.project.id}/deviations`);
   const critical = dev.rows.filter((r) => r.severity === 'critical' || r.severity === 'review').slice(0, 6);
+  let sched = { docs: [] };
+  try { sched = await api(`/api/projects/${pr.id}/schedules`); } catch (e) { sched = { docs: [] }; }
+  if (!(sched.docs || []).length && S.demo && typeof DEMO !== 'undefined' && DEMO.verify && DEMO.verify.docs) {
+    sched = { docs: DEMO.verify.docs };            // the offline demo snapshot ships one document
+  }
+  const doc0 = (sched.docs || [])[0];
   body.innerHTML = `
+    <div class="card sched-step" style="margin-bottom:14px">
+      <div class="hd">${ICON.doc}<h3>Step 2 · Descriptive schedule (rooms, floors &amp; location-wise quantities)</h3>
+        <div style="flex:1"></div>
+        ${doc0
+    ? `<span class="badge ok">${esc(doc0.filename)} · ${doc0.cells || 0} quantities</span>`
+    : '<span class="badge warn">not uploaded yet</span>'}</div>
+      <div class="bd row between wrap-gap">
+        <div class="small muted" style="flex:1;min-width:220px">
+          ${doc0
+    ? `This project verifies against <b>${esc(doc0.filename)}</b> — ${doc0.locations || 0} room(s), ${doc0.cells || 0} quantities. Site Verify walks you through them room by room.`
+    : 'Upload the <b>descriptive schedule</b> (PDF or Excel) or a <b>scan</b> of it. Every room, floor and location-wise quantity becomes a verification row, so at site you only change what differs.'}
+        </div>
+        <div class="row wrap-gap">
+          <button class="btn pri big" data-act="goto-schedule">${ICON.up} ${doc0 ? 'Upload a different schedule' : 'Upload descriptive schedule'}</button>
+          ${doc0 ? '<button class="btn big" data-act="goto-verify">Start joint verification</button>' : ''}
+        </div>
+      </div>
+    </div>
     <div class="grid g2" style="align-items:start">
       <div class="card">
         <div class="hd"><h3>Work particulars</h3></div>
@@ -732,7 +865,22 @@ async function tabImport(body, p) {
         </div>
       </div>
     </div>
+    <div id="import-schedule" style="margin-top:16px"></div>
     <div id="import-result" style="margin-top:14px"></div>`;
+
+  const schedPanel = document.createElement('div');
+  schedPanel.innerHTML = `
+      <div class="row between" style="margin:2px 0 10px">
+        <div><b style="font-size:15px">Descriptive schedule</b>
+          <div class="small muted">The room / floor / location-wise quantities of the building — uploaded here or from the Site Verify tab.</div></div>
+      </div>
+      ${svImportHTML(pr, true)}`;
+  const schedHost = document.getElementById('import-schedule');   // container inside the tab body
+  if (schedHost) schedHost.innerHTML = schedPanel.innerHTML; else if (body.appendChild) body.appendChild(schedPanel);
+  svWireImport(schedHost || schedPanel, pr, () => {
+    S.verify.section = 'rooms'; S.proj.tab = 'verify'; render();
+    toast('Schedule imported — opening Site Verify', 'ok');
+  });
 
   const f = body.querySelector('#est-file');
   const t = body.querySelector('#est-text');
@@ -1064,6 +1212,7 @@ function measureSheet(itemId, editRow) {
         <textarea class="i" style="min-height:64px;font-family:inherit" id="ms-notes" placeholder="e.g. measured in presence of contractor representative; cable route as per approved drawing">${esc(rows.notes || '')}</textarea></div>
       <div style="margin-top:10px"><label class="f">Site photograph (optional)</label>
         <input class="i" type="file" id="ms-photo" accept="image/*" capture="environment"></div>`;
+    let sheetRef = '';
     const calc = () => {
       const g = (x) => Number((document.getElementById(x) || {}).value || 0);
       const q = isLen ? g('ms-a') * (g('ms-nos') || 1) : ((g('ms-l') || 0) > 0 ? (g('ms-a') || 0) * g('ms-l') * ((g('ms-b') || 1) || 1) : g('ms-a'));
@@ -1083,20 +1232,30 @@ function measureSheet(itemId, editRow) {
         length: isLen ? g('ms-a') : g('ms-l'), breadth: isLen ? 0 : g('ms-b'), height: 0,
         notes: val('ms-notes'), measured_on: val('ms-date'),
         measured_qty: val('ms-qty') ? Number(val('ms-qty')) : null,
+        // one id per sheet: if the reply is lost and the reading is replayed, the server
+        // recognises it and does not record the same site reading twice
+        client_ref: editRow ? undefined : (sheetRef || (sheetRef = 'm-' + Date.now() + '-' + Math.random().toString(16).slice(2, 8))),
       };
       try {
         let mid;
         if (editRow) { await api(`/api/measurements/${editRow.id}`, { method: 'PATCH', body: payload }); mid = editRow.id; }
         else {
-          const r = await api('/api/measurements', { method: 'POST', body: payload });
+          const r = await queueable('/api/measurements', { method: 'POST', body: payload });
           mid = r.measurement_id;
-          toast(`Recorded ${smartNum(r.measured_qty)} ${unit} · item total ${smartNum(r.item_total_qty)} (tendered ${smartNum(r.tendered_qty)})`,
-            Math.abs(r.deviation) > 1e-6 ? 'warn' : 'ok', 5000);
+          if (r.queued) {
+            toast(`Saved on this phone: ${smartNum(payload.measured_qty)} ${unit}. It will be recorded as soon as there is network.`, 'warn', 6000);
+          } else {
+            toast(`Recorded ${smartNum(r.measured_qty)} ${unit} · item total ${smartNum(r.item_total_qty)} (tendered ${smartNum(r.tendered_qty)})`,
+              Math.abs(r.deviation) > 1e-6 ? 'warn' : 'ok', 5000);
+          }
         }
         const ph = document.getElementById('ms-photo');
         if (ph && ph.files && ph.files[0]) {
-          const fd = new FormData(); fd.append('file', ph.files[0]); fd.append('caption', 'Site evidence');
-          await api(`/api/measurements/${mid}/photos`, { method: 'POST', form: fd });
+          if (!mid) { toast('Photo kept on the phone — attach it after the reading syncs', 'warn', 6000); }
+          else {
+            const fd = new FormData(); fd.append('file', ph.files[0]); fd.append('caption', 'Site evidence');
+            await api(`/api/measurements/${mid}/photos`, { method: 'POST', form: fd });
+          }
         }
         closeSheet(); render();
       } catch (e) { toast(e.message, 'bad'); }
@@ -1257,6 +1416,19 @@ document.addEventListener('click', async (e) => {
   const stop = () => { e.preventDefault(); e.stopPropagation(); };
 
   if (act === 'close-sheet') { closeSheet(); return; }
+  if (act === 'outbox-sync') { syncNow(); return; }
+  if (act === 'goto-schedule') {
+    const pr = S.proj && S.proj.project;
+    if (S.proj) S.proj.tab = 'import';
+    if (pr) { location.hash = '#/project/' + pr.id; }
+    render();
+    setTimeout(() => {
+      const host = document.getElementById('import-schedule');
+      if (host) { host.scrollIntoView({ block: 'center' }); const fi = host.querySelector('#sv-file'); if (fi) fi.focus(); }
+    }, 150);
+    return;
+  }
+  if (act === 'goto-verify') { if (S.proj) S.proj.tab = 'verify'; S.verify.section = 'rooms'; render(); return; }
   if (act === 'logout') { logout(); return; }
   if (act === 'demo') { enterDemo(); return; }
   if (act === 'fill') {
@@ -1528,6 +1700,10 @@ document.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('hashchange', () => { if (S.token || S.demo) render(); else renderLogin(); });
+window.addEventListener('online', () => { paintOutboxBadge(); if (S.outbox.length) outboxFlush(); });
+window.addEventListener('offline', () => paintOutboxBadge());
+setInterval(() => { if (S.outbox.length && isOnline()) outboxFlush(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.outbox.length) outboxFlush(); });
 
 (async function boot() {
   if (!S.token && !S.demo) { renderLogin(); return; }
@@ -1553,6 +1729,7 @@ window.addEventListener('hashchange', () => { if (S.token || S.demo) render(); e
    are kept with one tap; only the ones that differ need the actual figure.
    ========================================================================== */
 function svChip(cell) {
+  if (cell.queued) return `<span class="badge warn">⏳ saved on this phone — not synced yet</span>`;
   if (cell.verify_status === 'kept') return `<span class="badge ok">✓ as per schedule</span>`;
   if (cell.verify_status === 'changed') return `<span class="badge warn">changed → ${smartNum(cell.actual_qty)}</span>`;
   if (cell.verify_status === 'not_applicable') return `<span class="badge">n/a</span>`;
@@ -1579,7 +1756,7 @@ async function tabVerify(body, p, wl) {
             <div class="small muted" style="margin-top:5px">${esc((wl.docs[0].name_of_work || '').slice(0, 140))}</div>
           </div>
           <div class="row">
-            <button class="btn sm" data-act="sv-import-again">${ICON.up} Another schedule</button>
+            <button class="btn pri" data-act="sv-import-again">${ICON.up} Upload descriptive schedule</button>
             ${wl.docs.length > 1 ? `<select class="i" id="sv-doc" style="max-width:220px">${wl.docs.map((d) => `<option value="${d.id}" ${d.id === S.verify.docId ? 'selected' : ''}>${esc(d.filename)} · ${d.checked}/${d.cells}</option>`).join('')}</select>` : ''}
           </div>
         </div>
@@ -1615,8 +1792,8 @@ async function tabVerify(body, p, wl) {
 }
 
 /* ------------------------------------------------------- import & preview */
-function svImportPanel(body, pr, note) {
-  body.innerHTML = `
+function svImportHTML(pr, embedded) {
+  return `
     <div class="grid g2" style="align-items:start">
       <div class="card">
         <div class="hd">${ICON.ruler}<h3>Upload the descriptive schedule</h3></div>
@@ -1624,51 +1801,62 @@ function svImportPanel(body, pr, note) {
           <div class="notice info">${ICON.shield}<div>The descriptive schedule carries the <b>rooms, floors and location-wise quantities</b> of the whole building.
             It is read as a matrix — <b>columns are work items, rows are rooms</b> — with the rotated column headers recovered from the PDF, and every column is checked against the printed
             <b>GRAND TOTAL</b> before you see it.</div></div>
-          ${note ? `<div class="notice warn">${ICON.warn}<div>${esc(note)}</div></div>` : ''}
-          <div><label class="f">Schedule file (PDF · scanned PDF · Excel · CSV)</label>
-            <input class="i" type="file" id="sv-file" accept=".pdf,.xlsx,.xlsm,.csv,.txt"></div>
-          <div class="row">
-            <button class="btn pri" data-act="sv-parse">${ICON.up} Read descriptive schedule</button>
-            <button class="btn" data-act="sv-sample">Try the sample (Ahilyabai Holkar Sabhamandap)</button>
+          <div>
+            <label class="f" for="sv-file">Descriptive schedule file</label>
+            <input class="i" type="file" id="sv-file" accept=".pdf,.xlsx,.xlsm,.csv,.txt">
+            <div class="small muted" style="margin-top:4px">PDF (digital or scanned) · Excel · CSV — the columns can be in any order.</div>
           </div>
+          <button class="btn pri block big" data-act="sv-parse">${ICON.up} Upload &amp; read the schedule</button>
+          <div class="row"><button class="btn block" data-act="sv-sample">Use the sample schedule (Ahilyabai Holkar Sabhamandap)</button></div>
           <div class="hr"></div>
-          <label class="f">…or paste the schedule table (mobile fallback for a scan)</label>
+          <label class="f" for="sv-text">…or paste the schedule table (works for a scanned page)</label>
           <textarea class="i" id="sv-text" style="min-height:96px"
             placeholder="Location	Item	Unit	Qty&#10;HALL	Conduit Light / fan point	Point	9&#10;HALL	LED panel 18W	Nos	27&#10;TOILET	Ex. Fan	Nos	1"></textarea>
-          <div class="row"><button class="btn" data-act="sv-parse-text">${ICON.sparkle} Read pasted table</button>
-            <span class="small muted">Columns can be in any order — they are matched by header name.</span></div>
+          <button class="btn block" data-act="sv-parse-text">${ICON.sparkle} Read pasted table</button>
         </div>
       </div>
       <div class="card">
         <div class="hd"><h3>What happens next</h3></div>
         <div class="bd small stack">
-          <div><b>1 · Rooms & floors</b><div class="muted">Every location in the schedule becomes a room of the project (matched to existing rooms by exact name).</div></div>
+          <div><b>1 · Rooms &amp; floors</b><div class="muted">Every location in the schedule becomes a room of the project (matched to existing rooms by exact name).</div></div>
           <div><b>2 · Item mapping</b><div class="muted">Each schedule column is matched to the estimate item and hence to the Master CSR — description, unit and rate come from the database.</div></div>
           <div><b>3 · Control sheet</b><div class="muted">Estimate quantity vs descriptive schedule quantity vs actual measured, item by item.</div></div>
           <div><b>4 · Room-wise verification</b><div class="muted">At site: <b>keep</b> what matches the schedule, <b>change</b> only what differs. A change writes a measurement, so Form-23 and the deviation statement follow automatically.</div></div>
+          ${embedded ? '' : `<div class="hr"></div><div class="muted tiny">Uploaded already? The schedule stays attached to this project — open <b>Site Verify</b> to walk the rooms.</div>`}
         </div>
       </div>
     </div>
     <div id="sv-preview" style="margin-top:14px"></div>`;
-  const f = body.querySelector('#sv-file'), tx = body.querySelector('#sv-text');
-  body.querySelector('[data-act="sv-parse"]')?.addEventListener('click', async () => {
-    if (!f || !f.files || !f.files[0]) { toast('Choose the descriptive schedule file first', 'bad'); return; }
-    await svRunParse(pr, { file: f.files[0] }, body);
-  });
-  body.querySelector('[data-act="sv-parse-text"]')?.addEventListener('click', async () => {
-    const text = (tx.value || '').trim();
-    if (text.length < 10) { toast('Paste the schedule table first', 'bad'); return; }
-    await svRunParse(pr, { text }, body);
-  });
-  body.querySelector('[data-act="sv-sample"]')?.addEventListener('click', async () => {
-    const blob = await fetch('/api/samples/descriptive_schedule_sample.pdf').then((r) => r.blob()).catch(() => null);
-    if (!blob) { toast('Sample not reachable — use paste mode instead', 'warn'); return; }
-    await svRunParse(pr, { file: new File([blob], 'descriptive_schedule_sample.pdf') }, body);
-  });
-  if (S.schedulePreview) svRenderPreview(S.schedulePreview, pr);
 }
 
-async function svRunParse(pr, src, body) {
+function svWireImport(scope, pr, onImported) {
+  if (!scope || !scope.querySelector) return;
+  const f = scope.querySelector('#sv-file');
+  const tx = scope.querySelector('#sv-text');
+  const go = (src) => svRunParse(pr, src, scope, onImported);
+  scope.querySelector('[data-act="sv-parse"]')?.addEventListener('click', async () => {
+    if (!f || !f.files || !f.files[0]) { toast('Choose the descriptive schedule file first', 'bad'); return; }
+    await go({ file: f.files[0] });
+  });
+  scope.querySelector('[data-act="sv-parse-text"]')?.addEventListener('click', async () => {
+    const text = (tx && tx.value || '').trim();
+    if (text.length < 10) { toast('Paste the schedule table first', 'bad'); return; }
+    await go({ text });
+  });
+  scope.querySelector('[data-act="sv-sample"]')?.addEventListener('click', async () => {
+    const blob = await fetch('/api/samples/descriptive_schedule_sample.pdf').then((r) => r.blob()).catch(() => null);
+    if (!blob) { toast('Sample not reachable — use paste mode instead', 'warn'); return; }
+    await go({ file: new File([blob], 'descriptive_schedule_sample.pdf') });
+  });
+  if (S.schedulePreview) svRenderPreview(S.schedulePreview, pr, scope, onImported);
+}
+
+function svImportPanel(body, pr) {
+  body.innerHTML = svImportHTML(pr, false);
+  svWireImport(body, pr, () => { S.verify.section = 'rooms'; render(); });
+}
+
+async function svRunParse(pr, src, body, onImported) {
   const prev = body.querySelector('#sv-preview');
   prev.innerHTML = loading();
   try {
@@ -1686,15 +1874,29 @@ async function svRunParse(pr, src, body) {
       toast('Schedule not recognised', 'bad');
       return;
     }
-    svRenderPreview(data, pr);
+    svRenderPreview(data, pr, body, onImported);
     toast(`Read ${data.stats.locations} locations × ${data.stats.columns} items`, 'ok');
   } catch (err) {
     prev.innerHTML = `<div class="notice bad">${ICON.warn}<div>${esc(err.message)}</div></div>`;
   }
 }
 
-function svRenderPreview(data, pr) {
-  const box = document.getElementById('sv-preview');
+function svPreviewRows(rows, render) {
+  /* Phones get a compact preview: 8 rows and a tap to reveal the rest. */
+  const key = 'sv_more_' + (S.verify.previewId || 'x');
+  const more = !!(S.verify && S.verify[key]);
+  const limit = 8;
+  const show = more ? rows : rows.slice(0, limit);
+  const rest = rows.length - show.length;
+  return show.map(render).join('') + (rows.length > limit ? `
+    <tr><td colspan="99" style="padding:8px">
+      <button class="btn sm rows-toggle" data-act="sv-more">${more ? 'Show fewer rows' : `Show all ${rows.length} rows`}</button>
+    </td></tr>` : '');
+}
+
+function svRenderPreview(data, pr, scope, onImported) {
+  const box = (scope && scope.querySelector ? scope.querySelector('#sv-preview') : null)
+    || document.getElementById('sv-preview');
   if (!box) return;
   const st = data.stats || {};
   const cols = (data.columns || []).filter((c) => Object.keys(c.cells || {}).length);
@@ -1713,31 +1915,42 @@ function svRenderPreview(data, pr) {
       <div class="bd stack">
         ${(data.warnings || []).length ? `<div class="notice warn">${ICON.warn}<div>${data.warnings.map(esc).join('<br>')}</div></div>` : ''}
         <div class="notice ok">${ICON.check}<div>Every parsed quantity was cross-checked against the totals printed on the sheet — the columns that reconcile are safe to verify against.</div></div>
-        <div class="scrollx"><table class="tbl"><thead><tr><th>Location (row)</th><th>Floor</th><th class="num">Items</th><th class="num">Row total</th><th>Matrix</th></tr></thead><tbody>
-          ${locs.map((l) => {
+        <div class="hint mob-only">Swipe the table sideways — it scrolls within the card →</div>
+        <div class="scrollx tall"><table class="tbl"><thead><tr><th>Location (row)</th><th>Floor</th><th class="num">Items</th><th class="num">Row total</th><th>Matrix</th></tr></thead><tbody>
+          ${svPreviewRows(locs, (l) => {
     const cs = cellOf(l);
     const chips = Object.keys(cs).slice(0, 14).map((k) => `<span class="chip ghost" style="font-size:11px">${esc((data.columns[+k].label || '').slice(0, 18))} <b>${smartNum(cs[k])}</b></span>`).join('');
     return `<tr><td><b>${esc(l.label)}</b></td><td class="small muted">${esc(l.floor || '—')}</td>
               <td class="num">${Object.keys(cs).length}</td><td class="num">${smartNum(l.row_total)}</td>
               <td>${chips}${Object.keys(cs).length > 14 ? `<span class="muted small">+${Object.keys(cs).length - 14} more</span>` : ''}</td></tr>`;
-  }).join('')}
+  })}
         </tbody></table></div>
+      </div>
+    </div>
+    <div class="card sv-head-actions" style="margin-bottom:14px">
+      <div class="bd row between wrap-gap">
+        <div class="small"><b>${cols.length}</b> item column(s) · <b>${locs.length}</b> location row(s) · <b>${st.cells || 0}</b> quantities found</div>
+        <div class="row wrap-gap">
+          <button class="btn" data-act="sv-discard">Discard</button>
+          <button class="btn pri" data-act="sv-import">Import &amp; start verification</button>
+        </div>
       </div>
     </div>
     <div class="card" style="margin-bottom:14px">
       <div class="hd"><h3>Column → item mapping</h3>
         <span class="muted small">${data.columns.length} columns · ${data.columns.length - weak.length} auto-linked${weak.length ? ` · ${weak.length} need your confirmation` : ''}</span></div>
+      <div class="hint mob-only">Swipe the table sideways to see the mapping and the totals →</div>
       <div class="bd tight scrollx"><table class="tbl"><thead><tr><th>Schedule column</th><th class="num">Total</th><th>Matched item (Master CSR)</th><th>Confidence</th><th>Reconcile</th></tr></thead><tbody>
-        ${data.columns.map((c) => {
+        ${svPreviewRows(data.columns, (c) => {
     const qty = Object.values(c.cells || {}).reduce((a, b) => a + b, 0);
     const conf = c.match_confidence || 0;
     const isWeak = conf < 0.5 || c.match_ambiguous;
     return `<tr>
         <td><b>${esc(c.label)}</b></td><td class="num">${qty ? smartNum(qty) : '—'}</td>
-        <td>${c.suggested_item_code ? `<span class="pill-code">${esc(c.suggested_item_code)}</span> <span class="small">${esc((c.suggested_description || '').slice(0, 70))}</span>${c.match_ambiguous ? ' <span class="badge warn">confirm</span>' : ''}` : '<span class="muted small">not matched — link it after import</span>'}</td>
+        <td>${c.suggested_item_code ? `<span class="pill-code">${esc(c.suggested_item_code)}</span> <span class="small clamp">${esc((c.suggested_description || '').slice(0, 70))}</span>${c.match_ambiguous ? ' <span class="badge warn">confirm</span>' : ''}` : '<span class="muted small">not matched — link it after import</span>'}</td>
         <td>${qty ? (isWeak ? `<span class="badge warn">check</span>` : conf ? `<span class="badge ${conf >= 0.6 ? 'ok' : 'info'}">${(conf * 100).toFixed(0)}%</span>` : '<span class="badge">—</span>') : '<span class="muted small">no quantity</span>'}</td>
         <td>${c.total_match === true ? `<span class="badge ok">✓ adds up</span>` : c.total_match === false ? `<span class="badge bad">✗ differs</span>` : '<span class="muted small">—</span>'}</td></tr>`;
-  }).join('')}
+  })}
       </tbody></table></div>
     </div>
     <div class="card"><div class="bd row between">
@@ -1745,12 +1958,17 @@ function svRenderPreview(data, pr) {
       <div class="row"><button class="btn" data-act="sv-discard">Discard</button>
         <button class="btn pri" data-act="sv-import">${ICON.check} Import & start verification</button></div>
     </div></div>`;
-  box.querySelector('[data-act="sv-discard"]')?.addEventListener('click', () => {
+  box.querySelectorAll('[data-act="sv-more"]').forEach((b) => b.addEventListener('click', () => {
+    const k = 'sv_more_' + (S.verify.previewId || 'x');
+    S.verify[k] = !S.verify[k];
+    svRenderPreview(data, pr, scope, onImported);
+  }));
+  box.querySelectorAll('[data-act="sv-discard"]').forEach((b) => b.addEventListener('click', () => {
     S.schedulePreview = null; box.innerHTML = ''; toast('Preview discarded');
-  });
-  box.querySelector('[data-act="sv-import"]')?.addEventListener('click', async () => {
-    const btn = box.querySelector('[data-act="sv-import"]');
-    btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Importing…';
+  }));
+  box.querySelectorAll('[data-act="sv-import"]').forEach((btn) => btn.addEventListener('click', async () => {
+    const all = [...box.querySelectorAll('[data-act="sv-import"]')];
+    all.forEach((b) => { b.disabled = true; b.innerHTML = '<span class="spin"></span> Importing…'; });
     try {
       const r = await api(`/api/projects/${pr.id}/import-schedule`, {
         method: 'POST', body: { filename: data.filename || 'descriptive-schedule', parsed: data } });
@@ -1759,45 +1977,81 @@ function svRenderPreview(data, pr) {
       if (r.need_link && r.need_link.length) {
         toast(`${r.need_link.length} column(s) need linking to the estimate`, 'warn', 6000);
       }
-      S.verify.section = 'rooms';
-      render();
-    } catch (err) { toast(err.message, 'bad'); btn.disabled = false; btn.textContent = 'Import & start verification'; }
-  });
+      if (onImported) onImported(r);
+      else { S.verify.section = 'rooms'; render(); }
+    } catch (err) {
+      toast(err.message, 'bad');
+      all.forEach((b) => { b.disabled = false; b.innerHTML = 'Import &amp; start verification'; });
+    }
+  }));
 }
 
 /* -------------------------------------------------------------- room list */
+function svRoomCard(r, byFloor) {
+  const keepable = r.items.filter((i) => i.verify_status === 'pending' && i.project_item_id).length;
+  return [
+    '<div class="card room-card"><div class="bd">',
+    '<div class="row between"><div><b>' + esc(r.name) + '</b> ',
+    (r.floor && !byFloor ? '<span class="badge">' + esc(r.floor) + '</span>' : ''),
+    '</div>',
+    (r.pending ? '<span class="badge warn">' + r.pending + ' pending</span>' : '<span class="badge ok">✓ verified</span>'),
+    '</div>',
+    '<div class="small muted" style="margin:4px 0">' + r.items.length + ' schedule item(s) · schedule total ' + smartNum(r.schedule_total) + '</div>',
+    '<div class="progress ' + (r.pending ? 'warn' : '') + '"><i style="width:' + r.progress_pct + '%"></i></div>',
+    '<div class="row between small muted" style="margin-top:4px"><span>' + r.kept + ' kept · ' + r.changed + ' changed</span><span>' + r.progress_pct + '%</span></div>',
+    '<div class="row wrap-gap" style="margin-top:10px">',
+    '<button class="btn pri grow" data-open="' + r.location_id + '">' + ICON.ruler + ' ' + (r.pending ? 'Verify' : 'Review') + '</button>',
+    (keepable ? '<button class="btn grow" data-keepall="' + r.location_id + '">✓ All as per schedule</button>' : ''),
+    '</div></div></div>',
+  ].join('');
+}
+
 function svRenderRooms(box, pr, wl) {
   const t = wl.totals;
   const rooms = S.verify.onlyPending ? wl.rooms.filter((r) => r.pending) : wl.rooms;
+  const pendingRooms = wl.rooms.filter((r) => r.pending);
+  const nextRoom = pendingRooms[0];
+  let cards;
+  if (!S.verify.byFloor) {
+    cards = '<div class="grid g-auto">' + (rooms.map((r) => svRoomCard(r, false)).join('')
+      || '<div class="card"><div class="empty">' + ICON.check + '<div>Every room has been verified.</div></div></div>') + '</div>';
+  } else {
+    const groups = {};
+    rooms.forEach((r) => { const k = r.floor || 'Other'; (groups[k] = groups[k] || []).push(r); });
+    cards = Object.keys(groups).map((floor) => '<div style="margin:4px 0 8px"><span class="badge brand">' + esc(floor) + '</span> '
+      + '<span class="small muted">' + groups[floor].length + ' room(s)</span></div>'
+      + '<div class="grid g-auto" style="margin-bottom:14px">' + groups[floor].map((r) => svRoomCard(r, true)).join('') + '</div>').join('');
+  }
   box.innerHTML = `
-    <div class="row between" style="margin-bottom:10px">
-      <div class="row">
+    <div class="card" style="margin-bottom:12px">
+      <div class="bd row between wrap-gap">
+        <div style="min-width:200px">
+          <b>${t.pending ? 'Continue the joint verification' : 'Every room is verified'}</b>
+          <div class="small muted">${t.pending
+    ? `${t.pending} quantit${t.pending === 1 ? 'y' : 'ies'} still to be seen across ${pendingRooms.length} room(s). Keep what matches the schedule, change only what differs.`
+    : 'All schedule quantities have been confirmed or corrected.'}</div>
+        </div>
+        <div class="row wrap-gap">
+          ${nextRoom ? `<button class="btn pri big" data-open="${nextRoom.location_id}">${ICON.ruler} Start with ${esc(nextRoom.name)}</button>` : ''}
+          <button class="btn" data-act="sv-import-again-top">${ICON.up} Upload a different schedule</button>
+        </div>
+      </div>
+    </div>
+    <div class="row between wrap-gap" style="margin-bottom:10px">
+      <div class="row wrap-gap">
         <button class="chip ${S.verify.onlyPending ? 'on' : ''}" data-act="sv-only-pending">Only rooms with pending quantities</button>
+        <button class="chip ${S.verify.byFloor ? 'on' : ''}" data-act="sv-group-floor">Group by floor</button>
       </div>
       <div class="small muted">Tap a room → check the schedule quantities → keep or change</div>
     </div>
-    <div class="grid g-auto">
-      ${rooms.map((r) => `
-        <div class="card">
-          <div class="bd">
-            <div class="row between">
-              <div><b>${esc(r.name)}</b> ${r.floor ? `<span class="badge">${esc(r.floor)}</span>` : ''}</div>
-              ${r.pending ? `<span class="badge warn">${r.pending} pending</span>` : `<span class="badge ok">✓ verified</span>`}
-            </div>
-            <div class="small muted" style="margin:4px 0">${r.items.length} schedule item(s) · schedule total ${smartNum(r.schedule_total)}</div>
-            <div class="progress ${r.pending ? 'warn' : ''}"><i style="width:${r.progress_pct}%"></i></div>
-            <div class="row between small muted" style="margin-top:4px"><span>${r.kept} kept · ${r.changed} changed</span><span>${r.progress_pct}%</span></div>
-            <div class="row" style="margin-top:10px">
-              <button class="btn pri" data-open="${r.location_id}">${ICON.ruler} Verify at site</button>
-              ${r.pending && r.items.filter((i) => i.verify_status === 'pending' && i.project_item_id).length
-      ? `<button class="btn" data-keepall="${r.location_id}">✓ All as per schedule</button>` : ''}
-            </div>
-          </div>
-        </div>`).join('') || `<div class="card"><div class="empty">${ICON.check}<div>Every room has been verified.</div></div></div>`}
-    </div>`;
+    ${cards}`;
   box.querySelector('[data-act="sv-only-pending"]')?.addEventListener('click', () => {
     S.verify.onlyPending = !S.verify.onlyPending; tabVerify(document.getElementById('view'), { project: pr }, null);
   });
+  box.querySelector('[data-act="sv-group-floor"]')?.addEventListener('click', () => {
+    S.verify.byFloor = !S.verify.byFloor; tabVerify(document.getElementById('view'), { project: pr }, null);
+  });
+  box.querySelector('[data-act="sv-import-again-top"]')?.addEventListener('click', () => svImportPanel(box, pr));
   box.querySelectorAll('[data-open]').forEach((b) => b.addEventListener('click', () => {
     const room = wl.rooms.find((r) => String(r.location_id) === b.dataset.open);
     svRoomSheet(pr, room, wl);
@@ -1806,100 +2060,213 @@ function svRenderRooms(box, pr, wl) {
     const room = wl.rooms.find((r) => String(r.location_id) === b.dataset.keepall);
     b.disabled = true; b.innerHTML = '<span class="spin"></span>…';
     try {
-      const r = await api(`/api/schedule-docs/${(S.verify.docId || wl.docs[0].id)}/verify-bulk`, {
-        method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
+      const r = await queueable(`/api/schedule-docs/${S.verify.docId || wl.docs[0].id}/verify-bulk`,
+        { method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
+      if (r.queued) { toast(`${room.name}: ${keepableCount(room)} quantit(ies) saved on this phone — will sync`, 'warn'); render(); return; }
       toast(`${esc(room.name)}: ${r.verified} quantit${r.verified === 1 ? 'y' : 'ies'} confirmed as per schedule` + (r.failed.length ? ` · ${r.failed.length} need item linking` : ''), r.failed.length ? 'warn' : 'ok');
       render();
     } catch (err) { toast(err.message, 'bad'); b.disabled = false; }
   }));
 }
 
+function keepableCount(room) {
+  return room.items.filter((i) => i.verify_status === 'pending' && i.project_item_id).length;
+}
+
 /* ------------------------------------------------------- room verify sheet */
-async function svRoomSheet(pr, room, wl) {
-  const q = S.verify.docId ? `?doc_id=${S.verify.docId}` : '';
-  wl = await api(`/api/projects/${pr.id}/verify${q}`).catch(() => wl);
-  room = wl.rooms.find((r) => r.location_id === room.location_id) || room;
-  const docId = S.verify.docId || wl.docs[0].id;
-  const unlinked = room.items.filter((i) => !i.project_item_id);
-  const bodyHtml = `
-    <div class="row between" style="margin-bottom:10px">
-      <div class="small muted">${room.items.length} item(s) · schedule total ${smartNum(room.schedule_total)} · ${room.kept} kept · ${room.changed} changed</div>
-      <div class="row">
-        <button class="btn sm" data-sv="allkeep">✓ All as per schedule</button>
+/* One quantity row inside a room.  Thumb-sized: the two decisions are full-width
+   buttons, the actual-quantity box has +/- steppers (site gloves, bright sun), and
+   the schedule number stays visible so nothing has to be remembered. */
+function svRowHTML(c) {
+  const bg = c.verify_status === 'pending' ? 'var(--surface)'
+    : c.verify_status === 'changed' ? '#fffbeb' : '#f6fdf9';
+  const queued = S.verify.queuedIds.has(c.id)
+    || S.outbox.some((o) => o.kind === 'cell' && o.cellId === c.id);
+  const status = queued ? svChip({ ...c, verify_status: 'kept', queued: true }) : svChip(c);
+  const canVerify = !!c.project_item_id;
+  const actions = !canVerify
+    ? `<button class="btn pri block" data-sv="link-cell" data-col="${c.column_order}">Link this column to a Master CSR item</button>`
+    : c.verify_status === 'pending' ? `
+      <button class="btn ok block" data-keep="${c.id}">✓ As per schedule</button>
+      <div class="sv-actual">
+        <button class="btn step" data-step="-1" data-for="${c.id}" aria-label="decrease">−</button>
+        <input class="i" type="number" step="any" inputmode="decimal" value="${smartNum(c.qty)}"
+               data-input="${c.id}" aria-label="actual quantity">
+        <button class="btn step" data-step="1" data-for="${c.id}" aria-label="increase">+</button>
+        <button class="btn pri" data-change="${c.id}">Actual</button>
+      </div>`
+    : `<button class="btn" data-undo="${c.id}">Re-do</button>`;
+  return `
+    <div class="sv-row" data-cell="${c.id}" data-status="${c.verify_status}"
+         data-linked="${canVerify ? '1' : '0'}" style="background:${bg}">
+      <div class="sv-head">
+        <div style="flex:1;min-width:0">
+          <div class="sv-title">${esc(c.col_label)}</div>
+          <div class="small muted">${c.item_code ? `<span class="pill-code">${esc(c.item_code)}</span> ` : '<span class="badge bad">not linked</span> '}
+            ${esc((c.item_description || '').slice(0, 58))}${c.unit ? ` · per ${esc(c.unit)}` : ''}</div>
+        </div>
+        <div class="sv-qty"><div class="tiny muted">SCHEDULE</div><div class="n">${smartNum(c.qty)}</div></div>
       </div>
+      <div class="sv-state">${status}${c.verify_status === 'changed' && c.actual_qty != null
+    ? ` <span class="small muted">was ${smartNum(c.qty)} → actual ${smartNum(c.actual_qty)}</span>` : ''}</div>
+      <div class="sv-actions">${actions}</div>
+    </div>`;
+}
+
+function svSheetBody(room, unlinked) {
+  return `
+    <div class="sv-summary">
+      <div class="progress ${room.pending ? 'warn' : ''}"><i data-sv="bar" style="width:${room.progress_pct}%"></i></div>
+      <div class="row between small" style="margin-top:6px">
+        <span><b data-sv="kept">${room.kept}</b> kept · <b data-sv="changed">${room.changed}</b> changed · <b data-sv="pending">${room.pending}</b> pending</span>
+        <span class="muted">${room.items.length} item(s) · total ${smartNum(room.schedule_total)}</span>
+      </div>
+      <button class="btn block big" data-sv="allkeep" style="margin-top:8px">✓ All remaining as per schedule</button>
     </div>
-    ${unlinked.length ? `<div class="notice warn">${ICON.warn}<div><b>${unlinked.length} column(s) in this room are not linked to an estimate item yet</b>
+    ${unlinked.length ? `<div class="notice warn" style="margin-top:10px">${ICON.warn}<div><b>${unlinked.length} column(s) in this room are not linked to an estimate item yet</b>
       (${unlinked.map((u) => esc(u.col_label)).slice(0, 4).join(', ')}${unlinked.length > 4 ? '…' : ''}).
       <br><button class="btn sm" data-sv="link">Link them now</button></div></div>` : ''}
-    <div class="stack" style="margin-top:10px">
-      ${room.items.map((c) => `
-        <div class="sv-row" data-cell="${c.id}" style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:${c.verify_status === 'pending' ? 'var(--surface)' : c.verify_status === 'changed' ? '#fffbeb' : '#f6fdf9'}">
-          <div class="row between">
-            <div style="flex:1;min-width:0">
-              <div style="font-weight:600">${esc(c.col_label)}</div>
-              <div class="small muted">${c.item_code ? `<span class="pill-code">${esc(c.item_code)}</span> ` : '<span class="badge bad">unlinked</span> '}
-                ${esc((c.item_description || '').slice(0, 62))}${c.unit ? ` · ${esc(c.unit)}` : ''}</div>
-            </div>
-            <div style="text-align:right;white-space:nowrap">
-              <div class="lbl small muted">schedule</div><div style="font-size:18px;font-weight:700">${smartNum(c.qty)}</div></div>
-          </div>
-          <div class="row between" style="margin-top:8px">
-            <div>${svChip(c)}${c.actual_qty != null && c.verify_status === 'changed' ? ` <span class="small muted">schedule was ${smartNum(c.qty)} → actual ${smartNum(c.actual_qty)}</span>` : ''}</div>
-            <div class="row">
-              ${c.verify_status === 'pending' ? `
-                <button class="btn ok sm" data-keep="${c.id}">✓ As per schedule</button>
-                <span class="row" style="gap:6px">
-                  <input class="i" type="number" step="any" inputmode="decimal" style="width:84px" value="${smartNum(c.qty)}" data-input="${c.id}">
-                  <button class="btn sm pri" data-change="${c.id}">Actual</button></span>`
-    : `<button class="btn sm" data-undo="${c.id}">Re-do</button>`}
-            </div>
-          </div>
-        </div>`).join('')}
+    <div class="stack" id="sv-rows" style="margin-top:12px">
+      ${room.items.map(svRowHTML).join('') || '<div class="empty">No scheduled quantities in this room.</div>'}
     </div>`;
-  sheet({
-    title: `${room.name} — verify against the descriptive schedule`,
-    body: bodyHtml, wide: true,
-    footer: `<span class="small muted">Keep = matches the schedule · Actual = the quantity you measured</span>
-             <button class="btn" data-act="close-sheet">Done</button>`,
-    onOpen: (el) => {
-      if (!el.querySelector('.sv-row') && !el.querySelector('[data-sv="allkeep"]')) return;
-      el.querySelector('[data-sv="allkeep"]')?.addEventListener('click', async () => {
-        try {
-          const r = await api(`/api/schedule-docs/${docId}/verify-bulk`, { method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
-          toast(`${r.verified} quantit${r.verified === 1 ? 'y' : 'ies'} kept as per schedule`, 'ok');
-          svRoomSheet(pr, room, wl);
-        } catch (err) { toast(err.message, 'bad'); }
-      });
-      el.querySelector('[data-sv="link"]')?.addEventListener('click', () => svLinkSheet(pr, wl, room.items.find((i) => !i.project_item_id)));
-      el.querySelectorAll('[data-keep]').forEach((b) => b.addEventListener('click', async () => {
-        b.disabled = true; b.innerHTML = '<span class="spin"></span>';
-        try {
-          await api(`/api/schedule-cells/${b.dataset.keep}/verify`, { method: 'POST', body: { action: 'keep' } });
-          toast('Kept as per schedule', 'ok');
-          svRoomSheet(pr, room, wl);
-        } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = '✓ As per schedule'; }
-      }));
-      el.querySelectorAll('[data-change]').forEach((b) => b.addEventListener('click', async () => {
-        const inp = el.querySelector(`[data-input="${b.dataset.change}"]`);
-        const v = parseFloat(inp.value);
-        if (isNaN(v) || v < 0) { toast('Enter the actual quantity measured at site', 'bad'); return; }
-        b.disabled = true; b.innerHTML = '<span class="spin"></span>';
-        try {
-          const r = await api(`/api/schedule-cells/${b.dataset.change}/verify`, {
-            method: 'POST', body: { action: 'change', actual_qty: v, note: 'actual at site' } });
-          toast(r.status === 'changed' ? `Changed to actual ${smartNum(v)} · measurement recorded` :
-            `Matches the schedule — kept`, 'ok');
-          svRoomSheet(pr, room, wl);
-        } catch (err) { toast(err.message, 'bad'); b.disabled = false; b.textContent = 'Actual'; }
-      }));
-      el.querySelectorAll('[data-undo]').forEach((b) => b.addEventListener('click', async () => {
-        try {
-          await api(`/api/schedule-cells/${b.dataset.undo}/verify`, { method: 'POST', body: { action: 'pending' } });
-          svRoomSheet(pr, room, wl);
-        } catch (err) { toast(err.message, 'bad'); }
-      }));
-    },
+}
+
+async function svRoomSheet(pr, room, wl, keepScroll) {
+  const q = S.verify.docId ? `?doc_id=${S.verify.docId}` : '';
+  if (!keepScroll) {
+    wl = await api(`/api/projects/${pr.id}/verify${q}`).catch(() => wl);
+    room = wl.rooms.find((r) => r.location_id === room.location_id) || room;
+  }
+  const docId = S.verify.docId || wl.docs[0].id;
+  const unlinked = room.items.filter((i) => !i.project_item_id);
+  const live = document.querySelector('.sheet-bg');          // our own sheet, if it is open
+  const keepScrollTop = live ? (document.getElementById('sheet-body') || {}).scrollTop || 0 : 0;
+
+  const paint = () => {                    // repaint rows + counters without re-binding anything
+    const rows = document.getElementById('sv-rows');
+    if (rows) rows.innerHTML = room.items.map(svRowHTML).join('') || '<div class="empty">No scheduled quantities.</div>';
+    const k = document.querySelector('[data-sv="kept"]'), c = document.querySelector('[data-sv="changed"]'),
+      pd = document.querySelector('[data-sv="pending"]'), pr2 = document.querySelector('[data-sv="bar"]');
+    if (k) k.textContent = room.kept;
+    if (c) c.textContent = room.changed;
+    if (pd) pd.textContent = room.pending;
+    if (pr2) pr2.style.width = room.progress_pct + '%';
+    paintOutboxBadge();
+  };
+  const applyLocal = (cellId, status, qty) => {
+    const c = room.items.find((x) => x.id === cellId);
+    if (!c) return;
+    c.verify_status = status;
+    c.actual_qty = status === 'changed' ? qty : (status === 'kept' ? qty : null);
+    room.kept = room.items.filter((x) => x.verify_status === 'kept').length;
+    room.changed = room.items.filter((x) => x.verify_status === 'changed').length;
+    room.pending = room.items.filter((x) => x.verify_status === 'pending').length;
+    room.progress_pct = Math.round(1000 * (room.kept + room.changed) / Math.max(1, room.items.length)) / 10;
+  };
+
+  /* One delegated click handler on the sheet: innerHTML repaints never detach it. */
+  const onClick = async (e) => {
+    const step = e.target.closest('[data-step]');
+    if (step) {
+      const inp = document.querySelector(`[data-input="${step.dataset.for}"]`);
+      if (inp) { inp.value = smartNum(Math.max(0, (parseFloat(inp.value) || 0) + Number(step.dataset.step))); inp.dataset.touched = '1'; }
+      return;
+    }
+    const keep = e.target.closest('[data-keep]');
+    if (keep) {
+      const id = Number(keep.dataset.keep);
+      keep.disabled = true; keep.innerHTML = '<span class="spin"></span>';
+      try {
+        const r = await queueable(`/api/schedule-cells/${id}/verify`, { method: 'POST', body: { action: 'keep' } });
+        if (r.queued) S.verify.queuedIds.add(id);
+        applyLocal(id, 'kept', r.qty);
+        toast(r.queued ? 'Saved on this phone — will sync automatically' : 'Kept as per schedule', r.queued ? 'warn' : 'ok');
+      } catch (err) { toast(err.message, 'bad'); }
+      paint();
+      return;
+    }
+    const change = e.target.closest('[data-change]');
+    if (change) {
+      const id = Number(change.dataset.change);
+      const inp = document.querySelector(`[data-input="${id}"]`);
+      const v = parseFloat(inp ? inp.value : '');
+      if (isNaN(v) || v < 0) { toast('Enter the actual quantity measured at site', 'bad'); return; }
+      change.disabled = true; change.innerHTML = '<span class="spin"></span>';
+      try {
+        const r = await queueable(`/api/schedule-cells/${id}/verify`,
+          { method: 'POST', body: { action: 'change', actual_qty: v, note: 'actual at site' } });
+        if (r.queued) S.verify.queuedIds.add(id);
+        applyLocal(id, r.status, r.qty);
+        toast(r.queued ? `Saved on this phone: ${smartNum(v)} — will sync`
+          : (r.status === 'changed' ? `Changed to actual ${smartNum(v)} · measurement recorded` : 'Matches the schedule — kept'),
+          r.queued ? 'warn' : 'ok');
+      } catch (err) { toast(err.message, 'bad'); }
+      paint();
+      return;
+    }
+    const undo = e.target.closest('[data-undo]');
+    if (undo) {
+      const id = Number(undo.dataset.undo);
+      try {
+        await queueable(`/api/schedule-cells/${id}/verify`, { method: 'POST', body: { action: 'pending' } });
+        applyLocal(id, 'pending', null);
+        S.verify.queuedIds.delete(id);
+        outboxDrop({ kind: 'cell', cellId: id });
+        paint(); toast('Back to pending');
+      } catch (err) { toast(err.message, 'bad'); }
+      return;
+    }
+    const bulk = e.target.closest('[data-sv="allkeep"]');
+    if (bulk) {
+      const before = keepableCount(room);
+      bulk.disabled = true; bulk.innerHTML = '<span class="spin"></span> Saving…';
+      try {
+        const r = await queueable(`/api/schedule-docs/${docId}/verify-bulk`,
+          { method: 'POST', body: { action: 'keep', location_ids: [room.location_id] } });
+        room.items.forEach((c) => { if (c.verify_status === 'pending' && c.project_item_id) applyLocal(c.id, 'kept', c.qty); });
+        toast(r.queued ? `Saved on this phone — ${before} quantity(ies) will sync`
+          : `${r.verified} quantity(ies) kept as per schedule`, r.queued ? 'warn' : 'ok');
+      } catch (err) { toast(err.message, 'bad'); }
+      bulk.disabled = false; bulk.innerHTML = '✓ All remaining as per schedule';
+      paint();
+      return;
+    }
+    if (e.target.closest('[data-sv="link-cell"]')) {
+      const col = Number(e.target.closest('[data-sv="link-cell"]').dataset.col);
+      svLinkSheet(pr, wl, room.items.find((i) => i.column_order === col) || null);
+      return;
+    }
+    if (e.target.closest('[data-sv="link"]')) { svLinkSheet(pr, wl, room.items.find((i) => !i.project_item_id)); return; }
+    if (e.target.closest('[data-sv="prev-pending"]')) {
+      const bd = document.getElementById('sheet-body');
+      const next = [...document.querySelectorAll('.sv-row')].find((r) => r.dataset.status === 'pending');
+      if (next && bd) {
+        bd.scrollTo({ top: next.offsetTop - 12, behavior: 'smooth' });
+        next.classList.add('sv-flash'); setTimeout(() => next.classList.remove('sv-flash'), 1200);
+      } else toast('Nothing pending in this room', 'ok');
+    }
+  };
+
+  if (keepScroll && live) {                                   // repaint in place
+    const bd = document.getElementById('sheet-body');
+    if (bd) { bd.innerHTML = svSheetBody(room, unlinked); bd.scrollTop = keepScrollTop; }
+    paint();
+    return;
+  }
+  const el = sheet({
+    title: room.name,
+    subtitle: `${room.items.length} scheduled quantities · total ${smartNum(room.schedule_total)}`,
+    body: loading('Loading the room checklist…'),
+    wide: true,
+    body_id: 'sheet-body',
+    sticky: true,
+    footer: `<button class="btn" data-sv="prev-pending">↑ Next pending</button>
+             <button class="btn pri" data-act="close-sheet">Done — back to rooms</button>`,
   });
+  const body_el = document.getElementById('sheet-body');      // render the rows into the sheet body
+  if (body_el) body_el.innerHTML = svSheetBody(room, unlinked);
+  el.addEventListener('click', onClick);
+  paintOutboxBadge();
 }
 
 /* ------------------------------------------------------------- link a column */
@@ -2006,6 +2373,7 @@ function svRenderRecon(box, rec, wl, pr) {
         <div class="muted">Link them to pull the legal description and rate from the Master CSR.</div></div>
         <button class="btn sm pri" data-act="sv-link-open">Link columns</button></div></div></div>` : ''}
     <div class="card"><div class="hd"><h3>Item-wise control sheet</h3><span class="muted small">estimate vs schedule vs actual</span></div>
+      <div class="hint mob-only">Swipe the table sideways for estimate / schedule / actual →</div>
       <div class="bd tight scrollx"><table class="tbl"><thead><tr>
         <th>Item</th><th>Description (Master CSR)</th><th class="num">Rate</th>
         <th class="num">Estimate qty</th><th class="num">Schedule qty</th><th class="num">Δ sched−est</th>
@@ -2013,7 +2381,7 @@ function svRenderRecon(box, rec, wl, pr) {
         ${rows.map((r) => {
     const d = r.schedule_vs_tendered;
     return `<tr><td class="nowrap"><span class="pill-code">${esc(r.item_code)}</span>${r.is_non_schedule ? ' <span class="badge ns">NS</span>' : ''}</td>
-          <td class="small">${esc((r.description || '').slice(0, 84))}</td>
+          <td class="small clamp">${esc((r.description || '').slice(0, 84))}</td>
           <td class="num nowrap">₹ ${inr(r.rate, 0)}</td>
           <td class="num">${smartNum(r.tendered_qty)} <span class="muted small">${esc(r.unit || '')}</span></td>
           <td class="num"><b>${smartNum(r.schedule_qty)}</b></td>

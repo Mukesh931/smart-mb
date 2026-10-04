@@ -21,6 +21,8 @@ def build() -> str:
 
     html = html.replace('<link rel="stylesheet" href="style.css">', f"<style>\n{css}\n</style>")
     html = html.replace('<script src="app.js"></script>', f"<script>\n{js}\n</script>")
+    html = html.replace('<link rel="manifest" href="manifest.json">',
+                        '<!-- manifest omitted in the single-file build -->')
     html = html.replace("<title>Smart-MB", "<title>Smart-MB (standalone build)")
     assert "style.css" not in html and "app.js" not in html, "external references remain"
     open(OUT, "w", encoding="utf-8").write(html)

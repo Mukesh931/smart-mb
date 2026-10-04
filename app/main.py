@@ -95,6 +95,7 @@ class MeasurementIn(BaseModel):
     notes: str = ""
     measured_on: str = ""
     measured_by: Optional[int] = None
+    client_ref: Optional[str] = None      # set by the phone when a measurement is queued offline
 
 
 class ConfirmImportIn(BaseModel):
@@ -1091,15 +1092,28 @@ def create_measurement(body: MeasurementIn, user: dict = Depends(current_user)):
                WHERE pi.id = ?""", (body.project_item_id,))
     if not it:
         raise HTTPException(404, "Project item not found")
+    # Offline replay safety: a measurement queued on the phone carries a client_ref, so if the
+    # POST reached the server but the reply was lost, the retry returns the original row instead
+    # of recording the same site reading twice.
+    if body.client_ref:
+        dup = q1("""SELECT * FROM measurements WHERE client_ref=? AND project_item_id=?""",
+                 (body.client_ref, body.project_item_id))
+        if dup:
+            total = q1("SELECT COALESCE(SUM(measured_qty),0) AS q FROM measurements WHERE project_item_id=?",
+                       (body.project_item_id,))["q"]
+            return {"ok": True, "duplicate": True, "measurement_id": dup["id"],
+                    "measured_qty": dup["measured_qty"], "item_total_qty": round(total, 3),
+                    "tendered_qty": it["tendered_qty"],
+                    "deviation": round(total - (it["tendered_qty"] or 0), 3)}
     qty = body.measured_qty if body.measured_qty is not None else compute_qty(
         it["unit"], body.nos, body.length, body.breadth, body.height)
     ts = now_iso()
     mid = ex("""INSERT INTO measurements (project_id, project_item_id, room_id, length, breadth, height, nos,
-                measured_qty, notes, measured_by, measured_on, status, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?, 'submitted', ?)""",
+                measured_qty, notes, measured_by, measured_on, status, client_ref, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?, 'submitted', ?, ?)""",
              (it["pid"], it["id"], body.room_id, body.length, body.breadth, body.height,
               body.nos, qty, body.notes, body.measured_by or user["id"],
-              body.measured_on or datetime.now().strftime("%Y-%m-%d"), ts)).lastrowid
+              body.measured_on or datetime.now().strftime("%Y-%m-%d"), body.client_ref, ts)).lastrowid
     audit(user, "MEASUREMENT_RECORDED", "measurements", mid,
           {"item": it["item_code"], "qty": qty, "room": body.room_id})
     total = q1("SELECT COALESCE(SUM(measured_qty),0) AS q FROM measurements WHERE project_item_id=?",

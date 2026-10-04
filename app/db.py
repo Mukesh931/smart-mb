@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS measurements (
     measured_by     INTEGER REFERENCES users(id),
     measured_on     TEXT,
     status          TEXT DEFAULT 'submitted',   -- submitted | approved | rejected
+    client_ref      TEXT,                       -- phone-generated id: makes offline replay idempotent
     created_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_meas_project ON measurements (project_id);
@@ -297,10 +298,20 @@ CREATE TABLE IF NOT EXISTS audit_log (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive migrations - older databases keep working after an upgrade."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(measurements)")}
+    if cols and "client_ref" not in cols:
+        conn.execute("ALTER TABLE measurements ADD COLUMN client_ref TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meas_client ON measurements (client_ref, project_id)")
+    conn.commit()
+
+
 def init_db() -> None:
     conn = get_conn()
     conn.executescript(SCHEMA)
     conn.commit()
+    _migrate(conn)
 
 
 def audit(actor: dict | None, action: str, entity: str = "", entity_id: Any = "",

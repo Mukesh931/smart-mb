@@ -180,6 +180,9 @@ row = [x for x in dev["rows"] if x["measured"] > 0][0]
 check("deviation math per item", abs(row["dev_amount"] - row["dev_qty"] * row["rate"]) < 0.01,
       f"{row['item_code']}: {row['measured']} vs {row['tendered']}")
 
+st, _items = call(f"/api/projects/{PID}/items", token=ETOK)
+_mi = _items["items"][0]["id"]
+
 print("\n[8b] Descriptive schedule - extract, reconcile, verify room-wise")
 st, sch_prev = upload(f"/api/projects/{PID}/parse-schedule",
                       os.path.join(ROOT, "samples", "descriptive_schedule_sample.pdf"), token=ETOK)
@@ -259,6 +262,18 @@ marked = [m for m in meas["measurements"] if (m.get("notes") or "").startswith("
 check("schedule verification wrote real measurements", len(marked) >= 3, f"{len(marked)} rows")
 st, xl, _ = call(f"/api/projects/{PID}/reconciliation.xlsx", raw=True, token=ETOK), None, None
 check("control sheet exports to Excel", st[0] == 200 and len(st[1]) > 4000, f"{len(st[1])} bytes")
+
+# offline safety: a reading queued on the phone is replayed with its client_ref
+st, m1 = call("/api/measurements", "POST", {"project_item_id": _mi, "measured_qty": 3,
+                                            "client_ref": "smoke-offline-1", "notes": "queued at site"}, token=ETOK)
+st2, m2 = call("/api/measurements", "POST", {"project_item_id": _mi, "measured_qty": 3,
+                                             "client_ref": "smoke-offline-1", "notes": "queued at site"}, token=ETOK)
+check("replaying a queued reading does not double-count it",
+      st == 200 and m2.get("duplicate") is True and m1["measurement_id"] == m2["measurement_id"],
+      f"measurement {m1.get('measurement_id')} recognised on replay")
+st, rows = call(f"/api/projects/{PID}/measurements", token=ETOK)
+check("only one row exists for the replayed reading",
+      len([r for r in rows["measurements"] if r.get("notes") == "queued at site"]) == 1)
 
 st, sch_txt = call(f"/api/projects/{PID}/parse-schedule-text", "POST",
                    {"text": "Location\tItem\tUnit\tQty\nHALL\tLED panel 18W\tNos\t27\nTOILET\tEx. Fan\tNos\t1"}, token=ETOK)

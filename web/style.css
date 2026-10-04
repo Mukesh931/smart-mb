@@ -184,7 +184,9 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 /* ---------- mobile nav / sheets / modal ---------- */
 .bottomnav {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 60; background: rgba(255,255,255,.97);
-  border-top: 1px solid var(--line); display: flex; padding: 6px 4px 8px; backdrop-filter: blur(8px);
+  border-top: 1px solid var(--line); display: flex;
+  padding: 6px 4px calc(8px + env(safe-area-inset-bottom, 0px));
+  backdrop-filter: blur(8px); box-shadow: 0 -6px 18px rgba(15,23,42,.06);
 }
 .bottomnav a {
   flex: 1; text-align: center; font-size: 10.5px; color: var(--muted); font-weight: 650; padding: 3px 0;
@@ -192,7 +194,9 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 }
 .bottomnav a svg { width: 21px; height: 21px; }
 .bottomnav a.on { color: var(--brand); background: #eef6fb; }
-.with-bottom { padding-bottom: 84px; }
+.with-bottom { padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px)); }
+/* tapping something near the bottom must scroll clear of the bottom nav */
+button, .btn, input, select, textarea, a { scroll-margin-bottom: 120px; scroll-margin-top: 70px; }
 @media (min-width: 901px) { .with-bottom { padding-bottom: 0; } }
 .sheet-bg { position: fixed; inset: 0; background: rgba(15,23,42,.5); z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
 @media (min-width: 701px) { .sheet-bg { align-items: center; } }
@@ -208,7 +212,15 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 .sheet .ft { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; gap: 9px; }
 .sheet .ft .btn { flex: 1; justify-content: center; }
 .grabber { width: 42px; height: 4px; border-radius: 9px; background: #cbd5e1; margin: 8px auto -4px; }
-#toasts { position: fixed; left: 50%; transform: translateX(-50%); bottom: 96px; z-index: 200; display: flex; flex-direction: column; gap: 8px; width: min(92vw, 420px); }
+/* A toast is a notice, never a barrier. It carries nothing to tap, so the whole
+   layer is click-through, and on a phone it slides in from the top where it can
+   never sit over the bottom navigation or a sticky action bar. */
+#toasts { position: fixed; left: 50%; transform: translateX(-50%); bottom: 96px; z-index: 200;
+  display: flex; flex-direction: column; gap: 8px; width: min(92vw, 420px); pointer-events: none; }
+#toasts .toast, #toasts .toast * { pointer-events: none; }
+@media (max-width: 900px) {
+  #toasts { top: calc(10px + env(safe-area-inset-top, 0px)); bottom: auto; }
+}
 @media (min-width: 901px) { #toasts { bottom: 24px; } }
 .toast { padding: 11px 13px; border-radius: 11px; box-shadow: var(--shadow-lg); font-size: 13.5px; background: #0f172a; color: #fff; display: flex; gap: 9px; }
 .toast.ok { background: #14532d; } .toast.bad { background: #7f1d1d; } .toast.warn { background: #78350f; }
@@ -231,3 +243,97 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 .demo-creds button { text-align: left; }
 .hint { font-size: 11.5px; color: var(--muted); }
 code.kbd { background: #f1f5f9; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-family: var(--mono); font-size: 11.5px; }
+
+
+/* ============================================================================
+   SITE MODE - touch ergonomics for engineers working on a phone at the site
+   ========================================================================== */
+.wrap-gap { flex-wrap: wrap; gap: 8px; }
+.grow { flex: 1 1 140px; justify-content: center; }
+.btn.big { padding: 12px 16px; font-size: 14.5px; min-height: 48px; }
+.btn.step {
+  min-width: 48px; min-height: 44px; justify-content: center; font-size: 19px; font-weight: 700;
+  background: var(--surface-2); padding: 6px 10px;
+}
+
+/* ---- the offline / outbox bar ---- */
+.outbox-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 14px; font-size: 13px; font-weight: 600;
+  background: #fff7e6; color: #8a4b00; border-bottom: 1px solid #fde68a;
+}
+.outbox-bar .dot { width: 9px; height: 9px; border-radius: 99px; background: #f59e0b; flex: 0 0 auto; }
+.outbox-bar .dot.bad { background: #dc2626; }
+.outbox-bar .btn { margin-left: auto; }
+
+/* ---- room cards ---- */
+.room-card .bd { display: flex; flex-direction: column; }
+
+/* ---- room verification sheet ---- */
+.sheet .ft.sticky { position: sticky; bottom: 0; background: var(--surface); z-index: 2; }
+.sv-summary { padding-bottom: 4px; }
+.sv-row {
+  border: 1px solid var(--line); border-radius: 14px; padding: 12px 13px;
+  transition: background .2s, box-shadow .2s;
+}
+.sv-row.sv-flash { box-shadow: 0 0 0 3px #fde68a; }
+.sv-head { display: flex; align-items: flex-start; gap: 12px; }
+.sv-title { font-weight: 650; font-size: 14.5px; line-height: 1.25; }
+.sv-qty { text-align: right; white-space: nowrap; flex: 0 0 auto; }
+.sv-qty .n { font-size: 26px; font-weight: 750; letter-spacing: -.5px; line-height: 1.1; }
+.sv-state { margin-top: 6px; }
+.sv-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.sv-actions > .btn { flex: 1 1 100%; justify-content: center; min-height: 48px; font-size: 14.5px; }
+.sv-actual { display: flex; gap: 8px; align-items: stretch; flex: 1 1 100%; }
+.sv-actual input.i { flex: 1 1 auto; min-width: 66px; text-align: center; font-size: 17px; font-weight: 700; min-height: 44px; }
+.sv-actual .btn.pri { flex: 0 0 auto; min-width: 92px; justify-content: center; min-height: 44px; }
+
+@media (max-width: 700px) {
+  .wrap { padding: 12px; }
+  .btn { min-height: 44px; }
+  .btn.sm { min-height: 40px; }
+  /* Every tab stays visible on a phone: wrap into rows instead of a hidden side-scroll strip */
+  .tabs { flex-wrap: wrap; overflow-x: visible; }
+  .tabs button { flex: 1 1 auto; min-height: 42px; font-size: 12.5px; padding: 0 10px; }
+  .chip { min-height: 38px; }
+  .sheet { max-height: 96vh; border-radius: 18px 18px 0 0; }
+  .sheet .hd { position: sticky; top: 0; background: var(--surface); z-index: 3; }
+  .sheet .bd { padding: 12px 14px 18px; }
+  /* Wide data tables become scrollable panes on a phone: without a height cap the
+     55-column preview ran to 11,000 px and buried the confirm button below it. */
+  .scrollx { -webkit-overflow-scrolling: touch; max-height: 58vh; overflow: auto; }
+  .scrollx.tall { max-height: 46vh; }
+  .hint { display: block; font-size: 11px; color: var(--muted); padding: 0 14px 8px; }
+  .kpi .val { font-size: 22px; }
+  .topbar h1#ptitle { font-size: 16px; }
+}
+
+
+/* Long CSR wording inside wide tables: clamp to two lines on a phone so rows stay
+   scannable (a single item description used to take ~600 px of height). */
+@media (max-width: 700px) {
+  .scrollx table.tbl td { vertical-align: top; }
+  .scrollx table.tbl td.clamp, .scrollx table.tbl td .clamp {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; max-width: 62vw; line-height: 1.25;
+  }
+  .scrollx table.tbl td:first-child { max-width: 40vw; }
+}
+
+/* "show all rows" toggle for the long preview tables */
+.rows-toggle {
+  width: 100%; justify-content: center; border-style: dashed; background: var(--surface-2);
+  margin: 8px 0 2px;
+}
+
+
+/* The confirm action is repeated at the top of a long preview so it is never buried */
+.sv-head-actions { position: static; }
+
+/* Step cards on the project overview: the descriptive-schedule upload is a first-class step */
+.sched-step { border-color: #cfe3f2; background: linear-gradient(180deg, #f7fbfe 0%, var(--surface) 60%); }
+.sched-step .hd { border-bottom-color: #dceaf5; }
+@media (max-width: 700px) {
+  .sched-step .bd.row { display: block; }
+  .sched-step .btn.big { width: 100%; margin-top: 8px; }
+}

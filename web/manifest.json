@@ -1,0 +1,19 @@
+{
+  "name": "Smart-MB — PWD Electrical CSR & Site Verification",
+  "short_name": "Smart-MB",
+  "description": "Centralized CSR database, estimate reconciliation and room-wise site measurement for Maharashtra PWD Electrical engineers.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#08283c",
+  "theme_color": "#08283c",
+  "icons": [
+    {
+      "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgcng9IjIyIiBmaWxsPSIjMGI1YzhhIi8+PHRleHQgeT0iNjgiIHg9IjUwIiBmb250LXNpemU9IjU0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSJ3aGl0ZSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtd2VpZ2h0PSJib2xkIj5TTTwvdGV4dD48L3N2Zz4=",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
