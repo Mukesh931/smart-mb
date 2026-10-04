@@ -206,6 +206,41 @@ register (file, engine, anchors, matched, unknown).
 
 ---
 
+## 2b · Using it at site, on a phone
+
+Open <https://smart-mb.onrender.com> in Chrome or Safari on the phone and sign in. Everything below is
+designed for one thumb, outdoors, sometimes with no signal at all.
+
+**Finding the descriptive-schedule upload.** It is in three places, so it cannot be missed:
+
+1. **Project → Overview** opens with a *Step 2 · Descriptive schedule* card. Before the first import it
+   shows a full-width **Upload descriptive schedule** button; afterwards it names the file ("74
+   quantities") and offers **Upload a different schedule** and **Start joint verification**.
+2. **Project → Site Verify** header always carries a **Upload descriptive schedule** button.
+3. **Project → Smart Import → Descriptive schedule** — the full panel: choose a PDF/Excel file,
+   *or* paste the table text, *or* load the bundled sample. Scans are read the same way.
+
+**At site.** Site Verify lists rooms (optionally grouped by floor). Open a room, then:
+
+- **Keep** — the quantity matches the descriptive schedule; one tap, no typing.
+- **Change / Actual** — type the real figure on the numeric keypad; it is stored against the room.
+- **Re-do** — undo a keep/change before the MB is printed.
+- Unlinked columns show *Link this column to a Master CSR item* instead of verify buttons, so nothing
+  is ever recorded against an item code that does not exist.
+
+**No signal at site.** Every tap is written to the phone first and shown as a **queued** chip; the bar
+at the foot of the screen reads *"No network at site — N site records saved on this phone, not yet
+sent."* When the phone regains signal the queue drains by itself (and the *Sync now* button forces it).
+Each record carries a `client_ref`, so a replay after a flaky connection is recognised as a duplicate
+and never doubles the measurement.
+
+**Install it like an app.** Chrome: ⋮ → *Add to Home screen*. Safari: Share → *Add to Home Screen*. It
+opens full-screen (PWA manifest, `display: standalone`), portrait, with the theme colour of the app.
+
+**Offline demo in one file.** [`web/smart-mb-standalone.html`](web/smart-mb-standalone.html) is the
+whole UI with a demo snapshot embedded — open it from the phone's files with no server and no network
+at all.
+
 ## 3 · Screens
 
 | Route | Purpose |
