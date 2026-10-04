@@ -83,6 +83,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 @media (min-width: 901px) { .bottomnav { display: none !important; } .mob-only { display: none !important; } }
 @media (max-width: 900px) { .desk-only { display: none !important; } }
 
+/* Inline icon default. The ICON sprite carries no width/height of its own, so without
+   this an icon inside a flex row (card header, toast, notice) inflated to fill it. */
+svg { width: 18px; height: 18px; flex: none; }
+
 /* ---------- cards & bits ---------- */
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
 .card .hd { padding: 13px 15px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; }
@@ -195,8 +199,10 @@ table.tbl td.num, table.tbl th.num { text-align: right; font-variant-numeric: ta
 .bottomnav a svg { width: 21px; height: 21px; }
 .bottomnav a.on { color: var(--brand); background: #eef6fb; }
 .with-bottom { padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px)); }
-/* tapping something near the bottom must scroll clear of the bottom nav */
-button, .btn, input, select, textarea, a { scroll-margin-bottom: 120px; scroll-margin-top: 70px; }
+/* Anything we scroll to must land clear of the sticky topbar / bottom nav */
+button, .btn, input, select, textarea, a, .card, .sched-step, section, h3 {
+  scroll-margin-bottom: 120px; scroll-margin-top: 84px;
+}
 @media (min-width: 901px) { .with-bottom { padding-bottom: 0; } }
 .sheet-bg { position: fixed; inset: 0; background: rgba(15,23,42,.5); z-index: 90; display: flex; align-items: flex-end; justify-content: center; }
 @media (min-width: 701px) { .sheet-bg { align-items: center; } }
@@ -222,7 +228,9 @@ button, .btn, input, select, textarea, a { scroll-margin-bottom: 120px; scroll-m
   #toasts { top: calc(10px + env(safe-area-inset-top, 0px)); bottom: auto; }
 }
 @media (min-width: 901px) { #toasts { bottom: 24px; } }
-.toast { padding: 11px 13px; border-radius: 11px; box-shadow: var(--shadow-lg); font-size: 13.5px; background: #0f172a; color: #fff; display: flex; gap: 9px; }
+.toast { padding: 11px 13px; border-radius: 11px; box-shadow: var(--shadow-lg); font-size: 13.5px; background: #0f172a; color: #fff; display: flex; gap: 9px; align-items: flex-start; max-width: 100%; }
+.toast svg, .notice svg, .badge svg, .chip svg { width: 17px; height: 17px; flex: 0 0 17px; }
+.toast svg { margin-top: 1px; }
 .toast.ok { background: #14532d; } .toast.bad { background: #7f1d1d; } .toast.warn { background: #78350f; }
 .spin { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: sp .7s linear infinite; }
 @keyframes sp { to { transform: rotate(360deg); } }
@@ -306,6 +314,14 @@ code.kbd { background: #f1f5f9; border: 1px solid var(--line); border-radius: 5p
   .hint { display: block; font-size: 11px; color: var(--muted); padding: 0 14px 8px; }
   .kpi .val { font-size: 22px; }
   .topbar h1#ptitle { font-size: 16px; }
+  /* Card headers wrap on a phone: a long title next to a long badge used to stack
+     one word per line and make the header 360 px tall. */
+  .card .hd { flex-wrap: wrap; align-items: flex-start; }
+  .card .hd h3 { flex: 1 1 100%; min-width: 0; }
+  .card .hd .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+  .card .hd .sub { flex: 1 1 100%; }
+  /* the sticky app bar is ~124 px tall — scroll targets must clear it */
+  button, .btn, input, select, textarea, a, .card, .sched-step, section, h3 { scroll-margin-top: 148px; }
 }
 
 
