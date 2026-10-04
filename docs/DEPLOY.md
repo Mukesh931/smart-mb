@@ -172,3 +172,36 @@ docker run -p 8000:8000 -e SMARTMB_SECRET=change-me \
 
 On a plain VM, `./run.sh` (or systemd + `uvicorn`) with Nginx as a TLS-terminating reverse
 proxy is enough; only `SMARTMB_SECRET` and `SMARTMB_DATA_DIR` need to be set.
+
+## Turning on automatic backups (do this once)
+
+Free/plain container hosting keeps SQLite inside the container: a spin-down, a redeploy or a
+crash starts from an empty database, which is how a work "disappears" and an upload then
+answers *Project not found*. `app/backup.py` snapshots the whole data directory
+(`smartmb.sqlite3`, `uploads/`, `photos/`) into a **private** GitHub repository and restores
+the latest snapshot on boot.
+
+One command line, using a Render API key and a GitHub token with `contents:write` on the
+backup repo:
+
+```bash
+RENDER_API_KEY=rnd_... python3 -m tools.set_backup_env \
+    --service srv-davab4qa3nsc73fgbe90 \
+    --repo mukesh931/smart-mb-data \
+    --token ghp_...
+```
+
+Or paste the same two values by hand into **Render → your service → Environment**:
+
+| Key | Value |
+| --- | --- |
+| `SMARTMB_BACKUP_REPO` | `mukesh931/smart-mb-data` |
+| `SMARTMB_BACKUP_TOKEN` | a GitHub token with `contents:write` on that repo |
+
+Optional: `SMARTMB_BACKUP_PATH` (default `snapshots/smartmb-data.tar.gz`),
+`SMARTMB_BACKUP_INTERVAL` (seconds between pushes after a write, default 120),
+`SMARTMB_PERSISTENT_DISK=1` if you attach a real disk.
+
+Then check `GET /api/health` → `"backup": {"configured": true}` and press **Back up now** in
+*Admin → Data safety*. **Revoke both credentials afterwards** — they are not needed to run the
+app, only to configure it.
