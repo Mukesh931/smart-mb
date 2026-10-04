@@ -175,21 +175,6 @@ def save_document(project_id: int, filename: str, parsed: dict, user: dict | Non
             "need_link": sorted(needs_link, key=lambda r: -r["qty_total"])}
 
 
-def _create_extra_item(project_id: int, spec: dict, user: dict | None) -> int:
-    """A schedule column absent from the estimate becomes an extra project item."""
-    order = (q1("SELECT COALESCE(MAX(sort_order),0) AS m FROM project_items WHERE project_id=?",
-                (project_id,))["m"] or 0) + 1
-    return ex("""INSERT INTO project_items (project_id, master_item_id, item_code, description, unit, rate,
-                    tendered_qty, is_non_schedule, ns_reason, source, confidence, match_method, sort_order,
-                    created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (project_id, spec.get("master_item_id"), spec.get("item_code") or "SCHED",
-               spec.get("description") or spec.get("col_label") or "Schedule item",
-               spec.get("unit") or "Each", float(spec.get("rate") or 0), float(spec.get("tendered_qty") or 0),
-               1 if not spec.get("master_item_id") else 0,
-               "" if spec.get("master_item_id") else "In descriptive schedule, not in estimate abstract",
-               "extra", 1.0, "schedule_column", order, now_iso())).lastrowid
-
-
 def list_documents(project_id: int) -> list[dict]:
     docs = rows_to_dicts(q("""SELECT d.*, u.name AS uploaded_by_name,
                                      (SELECT COUNT(*) FROM schedule_locations l WHERE l.doc_id=d.id) AS locations,
@@ -512,6 +497,7 @@ def map_column(doc_id: int, column_order: int, user: dict | None, *, project_ite
 
 
 def _create_extra_item(project_id: int, spec: dict, user: dict | None) -> int:
+    """A schedule column absent from the estimate becomes an extra (non-schedule) project item."""
     order = (q1("SELECT COALESCE(MAX(sort_order),0) AS m FROM project_items WHERE project_id=?",
                 (project_id,))["m"] or 0) + 1
     return ex("""INSERT INTO project_items (project_id, master_item_id, item_code, description, unit, rate,
