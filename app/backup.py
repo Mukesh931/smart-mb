@@ -21,6 +21,7 @@ UI still offers manual download/restore):
     SMARTMB_BACKUP_TOKEN    a fine-grained PAT with contents:write on that repository
     SMARTMB_BACKUP_PATH     path inside the repo, default snapshots/smartmb-data.tar.gz
     SMARTMB_BACKUP_INTERVAL seconds between automatic pushes, default 120
+    SMARTMB_BACKUP_AUTO=0   never push automatically (use on test instances sharing a repo)
 """
 from __future__ import annotations
 
@@ -40,6 +41,10 @@ REPO = os.environ.get("SMARTMB_BACKUP_REPO", "").strip()
 TOKEN = os.environ.get("SMARTMB_BACKUP_TOKEN", "").strip()
 SNAP_PATH = os.environ.get("SMARTMB_BACKUP_PATH", "snapshots/smartmb-data.tar.gz").strip()
 INTERVAL = int(os.environ.get("SMARTMB_BACKUP_INTERVAL", "120") or 120)
+# Two instances must never share one backup repository: whichever pushed last wins, and after
+# a restart the other one restores a stranger's data.  A test/staging instance therefore runs
+# with SMARTMB_BACKUP_AUTO=0 - it can still push by hand, but it never pushes on its own.
+AUTO = (os.environ.get("SMARTMB_BACKUP_AUTO", "1").strip().lower() not in ("0", "false", "no", "off"))
 API = "https://api.github.com"
 
 _lock = threading.Lock()
@@ -54,7 +59,7 @@ def configured() -> bool:
 def status(enabled_only: bool = False) -> dict:
     if enabled_only and not configured():
         return {"configured": False}
-    return {"configured": configured(), "repo": REPO, "path": SNAP_PATH, "interval": INTERVAL,
+    return {"configured": configured(), "repo": REPO, "path": SNAP_PATH, "auto": AUTO, "interval": INTERVAL,
             "last_push": _state["last_push"], "last_size": _state["last_size"],
             "last_restore": _state["last_restore"], "last_error": _state["last_error"],
             "pending": _state["dirty"]}
@@ -235,7 +240,8 @@ def mark_dirty() -> None:
 
 
 def _loop() -> None:
-    while True:
+    while AUTO:
+
         time.sleep(10)
         if not _state["dirty"]:
             continue
@@ -250,7 +256,7 @@ def _loop() -> None:
 
 
 def start_background() -> None:
-    if not configured() or _state["thread"]:
+    if not configured() or not AUTO or _state["thread"]:
         return
     t = threading.Thread(target=_loop, daemon=True, name="smartmb-backup")
     t.start()

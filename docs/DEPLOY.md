@@ -198,6 +198,11 @@ Or paste the same two values by hand into **Render → your service → Environm
 | `SMARTMB_BACKUP_REPO` | `mukesh931/smart-mb-data` |
 | `SMARTMB_BACKUP_TOKEN` | a GitHub token with `contents:write` on that repo |
 
+**Never point two instances at the same backup repository** (a local test instance and the live
+service, for example): whichever pushed last wins, and the other restores a stranger's data on its
+next boot. A test instance should set `SMARTMB_BACKUP_AUTO=0`, which keeps manual snapshots working
+but stops the automatic pushes.
+
 Optional: `SMARTMB_BACKUP_PATH` (default `snapshots/smartmb-data.tar.gz`),
 `SMARTMB_BACKUP_INTERVAL` (seconds between pushes after a write, default 120),
 `SMARTMB_PERSISTENT_DISK=1` if you attach a real disk.
